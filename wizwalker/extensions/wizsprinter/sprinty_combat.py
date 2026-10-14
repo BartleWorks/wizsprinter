@@ -94,6 +94,19 @@ async def is_enchantable(card: CombatCard) -> bool:
     ))
 
 
+async def _is_enchant(card: CombatCard) -> bool:
+    """Whether *card* is an enchant: it acts on a spell, and nothing is fused into it.
+
+    A card an enchant was fused into is never itself an enchant, whatever its
+    effects read, and its name carries the enchant's, so a lookup for an enchant
+    by name or by template rules it out here.
+    """
+    if await card.is_enchanted():
+        return False
+    effects = await card.get_spell_effects()
+    return any([await e.effect_target() is EffectTarget.spell for e in effects])
+
+
 damage_effects = {
     SpellEffects.damage,
     SpellEffects.damage_no_crit,
@@ -1102,10 +1115,8 @@ class SprintyCombat(CombatHandler):
                     cards = [c for c in all_cards if spell.name.lower() in (await c.name()).lower()]
 
             for c in cards:
-                if only_enchants:
-                    effects = await c.get_spell_effects()
-                    if not any(await e.effect_target() is EffectTarget.spell for e in effects):
-                        continue
+                if only_enchants and not await _is_enchant(c):
+                    continue
                 if only_enchantable and not await is_enchantable(c):
                     continue
                 res.append(c)
@@ -1126,6 +1137,8 @@ class SprintyCombat(CombatHandler):
 
             if only_enchantable:
                 res = [c for c in res if await is_enchantable(c)]
+            if only_enchants:
+                res = [c for c in res if await _is_enchant(c)]
 
             if len(res) > 0:
                 if multi:
@@ -2098,6 +2111,13 @@ class SprintyCombat(CombatHandler):
             _dbg(f"[MT-DBG] target is False for {move_config.target}")
             return False
 
+        # A card aimed at a spell is itself an enchant or discard, not the cast,
+        # so its own lookup takes only enchants: once an earlier slot has fused,
+        # a vague name such as `potent` also matches the enchanted card's name.
+        aims_at_spell = isinstance(target, Spell) or (
+            isinstance(target, list) and bool(target) and all(isinstance(t, Spell) for t in target)
+        )
+
         ttype = move_config.target.target_type if move_config.target else None
         req_t = target[0] if isinstance(target, list) else target
         req_member = req_t if isinstance(req_t, CombatMember) else None
@@ -2107,15 +2127,16 @@ class SprintyCombat(CombatHandler):
         # castable match (rather than failing the whole clause).
         if needs_post_filter:
             candidates = await self.try_get_spell(
-                move_config.move.card, only_enchantable=only_enchantable, multi=True,
-                enchant_bonus=enchant_bonus,
+                move_config.move.card, only_enchants=aims_at_spell, only_enchantable=only_enchantable,
+                multi=True, enchant_bonus=enchant_bonus,
             )
             if not candidates:
                 _dbg(f"[MT-DBG] no candidates for {move_config.move.card}")
                 return False
         else:
             single = await self.try_get_spell(
-                move_config.move.card, only_enchantable=only_enchantable, enchant_bonus=enchant_bonus
+                move_config.move.card, only_enchants=aims_at_spell, only_enchantable=only_enchantable,
+                enchant_bonus=enchant_bonus,
             )
             if single is None:
                 _dbg(f"[MT-DBG] cur_card is None for {move_config.move.card}")
@@ -2197,10 +2218,6 @@ class SprintyCombat(CombatHandler):
 
         # The round's card is picked. Held enchants run first unless it attacks;
         # an attack keeps its hand as it is and takes its own `[...]` enchant.
-        # A card aimed at a spell is itself an enchant or discard, not the cast.
-        aims_at_spell = isinstance(target, Spell) or (
-            isinstance(target, list) and bool(target) and all(isinstance(t, Spell) for t in target)
-        )
         if self.held_enchants and not aims_at_spell:
             if await card_is_attack(cur_card):
                 _dbg(f"[HOLD-DBG] {await cur_card.name()} attacks; held enchants dropped")
@@ -2280,7 +2297,7 @@ class SprintyCombat(CombatHandler):
             # first template match, which may not be the one that passed our filters.
             to_cast = cur_card
         else:
-            to_cast = await self.try_get_spell(move_config.move.card)
+            to_cast = await self.try_get_spell(move_config.move.card, only_enchants=aims_at_spell)
         if to_cast is None:
             return False  # this should not happen
         
@@ -2330,7 +2347,7 @@ class SprintyCombat(CombatHandler):
                         # satisfy our filters, and we've consumed the one that did.
                         to_cast = None
                     else:
-                        to_cast = await self.try_get_spell(move_config.move.card)
+                        to_cast = await self.try_get_spell(move_config.move.card, only_enchants=aims_at_spell)
                 except ValueError:
                     break # Issue: 8
         except wizwalker.errors.WizWalkerMemoryError or ValueError:
