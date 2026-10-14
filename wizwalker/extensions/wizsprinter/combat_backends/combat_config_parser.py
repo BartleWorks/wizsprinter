@@ -21,8 +21,9 @@ def get_sprinty_grammar():
             COND_AND: "&&"
             _cond_and: _newlines? COND_AND _newlines?
 
-            cond_target: cond_target_self | cond_target_boss | cond_target_enemy | cond_target_ally | cond_target_enemies | cond_target_allies
+            cond_target: cond_target_self | cond_target_boss | cond_target_enemy | cond_target_ally | cond_target_enemies | cond_target_allies | cond_target_deck
             cond_target_self: _spaced{"self"}
+            cond_target_deck: _spaced{"deck"}
             cond_target_boss: _spaced{"boss"}
             cond_target_enemy: _spaced{"enemy"} (_open_paren target_index _close_paren)?
             cond_target_ally: _spaced{"ally"} (_open_paren target_index _close_paren)?
@@ -212,6 +213,9 @@ class TreeToConfig(Transformer):
 
     def cond_target_self(self, _):
         return ConditionTarget(TargetType.type_self)
+
+    def cond_target_deck(self, _):
+        return ConditionTarget(TargetType.type_deck)
 
     def cond_target_boss(self, _):
         return ConditionTarget(TargetType.type_boss)

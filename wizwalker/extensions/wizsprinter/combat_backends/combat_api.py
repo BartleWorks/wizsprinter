@@ -18,6 +18,8 @@ class TargetType(Enum):
     type_select = auto()
     type_enemies = auto()
     type_allies = auto()
+    # Condition-only: the wizard's own deck, read through `deck.<attr>`.
+    type_deck = auto()
 
 
 class SpellType(Enum):

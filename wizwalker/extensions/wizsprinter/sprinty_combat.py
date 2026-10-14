@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import re
 from typing import *
 
 import wizwalker
@@ -35,6 +37,9 @@ _DEBUG = _os.environ.get("DEIMOS_COMBAT_DEBUG", "").lower() in ("1", "true", "ye
 def _dbg(msg: str) -> None:
     if _DEBUG:
         print(msg)
+
+
+logger = logging.getLogger(__name__)
 
 
 async def _flatten_effect(effect, out: List, depth: int = 0):
@@ -184,6 +189,75 @@ aoe_targets = {
     EffectTarget.friendly_team,
     EffectTarget.friendly_team_all_at_once
 }
+
+#: How long one enchant may take to fuse before it is given up on. The game
+#: refuses an enchant on a card it does not fit by doing nothing at all, and the
+#: waits below poll the hand for the fuse, so without a limit a refused enchant
+#: hangs the fight.
+ENCHANT_TIMEOUT = 5.0
+
+
+class _Restart:
+    """Returned by `try_execute_config` when held enchants must run before the
+    card it picked is cast. The round then walks its priorities again, since an
+    enchant can fuse the very card that was picked."""
+
+    def __repr__(self) -> str:
+        return "RESTART"
+
+
+RESTART = _Restart()
+
+_SPECIAL_MOVES = ("pass", "none", "willcast", "discard")
+
+
+def parse_card_count(text: str) -> Optional[Tuple[int, int]]:
+    """Cards left to draw and the deck size, from the `CountText` label.
+
+    The label reads `<center>Cards</center>\\n<center>13 of 20</center>` in
+    English and `13 sur 20` in French, so only its numbers are read: the first
+    and last integers on its last line. Treasure cards count in both.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    numbers = re.findall(r"\d+", re.sub(r"<[^>]*>", "", lines[-1]))
+    if len(numbers) < 2:
+        return None
+    return int(numbers[0]), int(numbers[-1])
+
+
+def is_enchant_only(move_config: MoveConfig) -> bool:
+    """Whether a priority only casts cards onto other cards in hand.
+
+    Such a slot never ends the turn, so it is held rather than run where it
+    stands: it runs just before the round's card is cast, and only when that
+    card is not an attack (`SprintyCombat._walk_priorities`). `discard`,
+    `pass` and `willcast` are not enchants, even aimed at a spell.
+    """
+    moves = move_config.move if isinstance(move_config.move, list) else [move_config.move]
+    targets = move_config.target if isinstance(move_config.target, list) else [move_config.target]
+    if not moves or len(moves) != len(targets):
+        return False
+    for move, target in zip(moves, targets):
+        if target is None or target.target_type is not TargetType.type_spell:
+            return False
+        card = move.card
+        if isinstance(card, DrawSpell):
+            return False
+        if isinstance(card, NamedSpell) and card.name in _SPECIAL_MOVES:
+            return False
+    return True
+
+
+async def card_is_attack(card: CombatCard) -> bool:
+    """Whether casting this card attacks: any damage effect aimed at an enemy,
+    damage over time and health steals included."""
+    for effect in await get_inner_card_effects(card):
+        if await effect.effect_type() in damage_effects and await effect.effect_target() in enemy_targets:
+            return True
+    return False
+
 
 class ReqSatisfaction(Enum):
     true = auto()
@@ -685,6 +759,12 @@ class SprintyCombat(CombatHandler):
         self.had_first_round = False
         self.rel_round_offset = 0
         self.handle_mouseless = handle_mouseless
+        # The hand as each round began, and how many cards it can hold: a hand
+        # the refill left short means the main pile is empty (`deck_remaining`).
+        self.round_start_hand: Optional[int] = None
+        self.max_hand_size: Optional[int] = None
+        # Enchant-only slots reached this walk, waiting for the round's cast.
+        self.held_enchants: List[MoveConfig] = []
 
     async def handle_combat(self):
         self.turn_adjust = 0
@@ -693,6 +773,9 @@ class SprintyCombat(CombatHandler):
         self.rel_round_offset = 0
         self.was_pass = False
         self.had_first_round = False
+        self.round_start_hand = None
+        self.max_hand_size = None
+        self.held_enchants = []
         self._did_deck_inspect = False  # one-shot deck dump per fight
         await super().handle_combat()
 
@@ -783,16 +866,31 @@ class SprintyCombat(CombatHandler):
             window = None
             while window is None:
                 window, *_ = await self.client.root_window.get_windows_with_name("CountText")
-            text: str = await window.maybe_text()
-            _, count_text = text.splitlines()
-            count_text = count_text[8:-9]
-            count_text = count_text.replace("of", "").strip()  # I know this sucks
-            res1, res2 = count_text.split()
-            return int(res1), int(res2)
+            # Read by its numbers alone: the word between them is localized,
+            # and stripping "of" read (0, 0) on every other language.
+            return parse_card_count(await window.maybe_text())
         try:
             return await wizwalker.utils.maybe_wait_for_any_value_with_timeout(_inner, sleep_time=0.2, timeout=2.0)
         except wizwalker.errors.ExceptionalTimeout:
             return (0, 0) # TODO: Maybe propagate, but good enough for now
+
+    async def deck_remaining(self) -> int:
+        """Cards left in the main pile, as `?(deck.remaining ...)` reads it.
+
+        The `CountText` label counts the treasure pile too, and nothing on the
+        client counts the main pile alone. But the refill at a round's start
+        draws only from the main pile, so a hand that began the round short of
+        full means the main pile is empty: 0. Otherwise the label's count, which
+        is exact for a deck carrying no treasure cards and overcounts by the
+        treasure pile until the main pile first runs short.
+        """
+        if (
+            self.round_start_hand is not None
+            and self.max_hand_size
+            and self.round_start_hand < self.max_hand_size
+        ):
+            return 0
+        return (await self.get_card_counts())[0]
 
     async def get_castable_cards(self) -> List[CombatCard]:  # extension for castable cards only
         async def _pred(card: CombatCard):
@@ -1215,6 +1313,19 @@ class SprintyCombat(CombatHandler):
             actual = (actual / max_val) * 100
         return float(actual)
 
+    #: What `deck.<attr>` can read. Unknown names are false, as for a member.
+    _DECK_ATTRS = ("remaining",)
+
+    async def _evaluate_deck_condition(self, condition: Condition) -> bool:
+        """`?(deck.remaining >= 2)`. A percentage has nothing to be a share of."""
+        if condition.attribute not in self._DECK_ATTRS or condition.is_percent:
+            _dbg(f"[COND-DBG] unsupported deck condition: {condition}")
+            return False
+        value = await self.deck_remaining()
+        result = self._compare(float(value), condition.op, condition.value)
+        _dbg(f"[COND-DBG] evaluate_condition: deck.remaining={value} {condition.op.value} {condition.value} -> {result}")
+        return result
+
     async def evaluate_condition(self, condition) -> bool:
         # AllCondition: short-circuit AND over its clauses.
         if isinstance(condition, AllCondition):
@@ -1223,6 +1334,8 @@ class SprintyCombat(CombatHandler):
                     return False
             return True
         try:
+            if condition.target.target_type is TargetType.type_deck:
+                return await self._evaluate_deck_condition(condition)
             target = await self.resolve_condition_target(condition.target)
             if target is None:
                 _dbg(f"[COND-DBG] evaluate_condition: target is None for {condition}")
@@ -1833,6 +1946,8 @@ class SprintyCombat(CombatHandler):
             willcasted = False
             for m, t in zip(move_config.move, move_config.target):
                 resp = await self.try_execute_config(MoveConfig(m, t), willcasted=willcasted)
+                if resp is RESTART:
+                    return RESTART
                 if type(resp) is tuple:
                     success, willcasted = resp
                 else:
@@ -1919,6 +2034,9 @@ class SprintyCombat(CombatHandler):
                 return False
             
             if single == "pass":
+                if self.held_enchants:
+                    # Enchant before giving the turn up: the freed slots refill.
+                    return RESTART
                 await self.pass_button()
                 return True
             
@@ -1987,6 +2105,19 @@ class SprintyCombat(CombatHandler):
                 _dbg(f"[REQ-DBG] no candidate passed post-filters for {move_config.move.card}")
             return False
 
+        # The round's card is picked. Held enchants run first unless it attacks;
+        # an attack keeps its hand as it is and takes its own `[...]` enchant.
+        # A card aimed at a spell is itself an enchant or discard, not the cast.
+        aims_at_spell = isinstance(target, Spell) or (
+            isinstance(target, list) and bool(target) and all(isinstance(t, Spell) for t in target)
+        )
+        if self.held_enchants and not aims_at_spell:
+            if await card_is_attack(cur_card):
+                _dbg(f"[HOLD-DBG] {await cur_card.name()} attacks; held enchants dropped")
+                self.held_enchants = []
+            else:
+                return RESTART
+
         # Multi-target spell — wrap single target in list for confirm button flow.
         # Use "enemies" / "allies" targets to select all, or select(...) for specific targets.
         is_mt = await card_is_multi_target(cur_card)
@@ -2018,11 +2149,13 @@ class SprintyCombat(CombatHandler):
                 if enchant_card is not None:
                     previous_cards = await self.get_cards()
                     previous_card_names = Counter([await card.name() for card in previous_cards])
-                    pre_enchant_count = len(await self.get_cards())
-                    while len(await self.get_cards()) == pre_enchant_count:
-                        await enchant_card.cast(cur_card, sleep_time=self.config.cast_time*2)
-                        await asyncio.sleep(self.config.cast_time*2) # give it some time for card list to update
-
+                    # A refused enchant leaves the card bare; only a mandatory
+                    # one fails the clause.
+                    if not await self._fuse_enchant(enchant_card, cur_card, recast=True):
+                        if not enchant_optional:
+                            return False
+                        enchant_card = None
+                if enchant_card is not None:
                     self.cur_card_count -= 1
                     new_cards = await self.get_cards()
                     new_card_names = Counter([await card.name() for card in new_cards])
@@ -2033,12 +2166,11 @@ class SprintyCombat(CombatHandler):
                             second_enchant_card = await self.try_get_spell(move_config.move.second_enchant, only_enchants=False)
                             if second_enchant_card != "none":
                                 if second_enchant_card is not None:
-                                    pre_enchant_count = len(await self.get_cards())
-                                    while len(await self.get_cards()) == pre_enchant_count:
-                                        await second_enchant_card.cast(cur_card, sleep_time=self.config.cast_time*2)
-                                        await asyncio.sleep(self.config.cast_time*2) # give it some time for card list to update
-                                    self.cur_card_count -= 1
-                                
+                                    if await self._fuse_enchant(second_enchant_card, cur_card, recast=True):
+                                        self.cur_card_count -= 1
+                                    elif not enchant_is_optional(move_config.move.second_enchant):
+                                        return False
+
                                 elif second_enchant_card is None and not enchant_is_optional(move_config.move.second_enchant):
                                     return False
 
@@ -2067,7 +2199,6 @@ class SprintyCombat(CombatHandler):
             while to_cast != None:
                 try:
                     if isinstance(target, Spell):
-                        card_count = await self.get_num_card_windows()
                         target = await self.try_get_spell(target, castable=False, multi=True, only_enchantable=True)
                         if target:
                             if type(target) is list:
@@ -2095,9 +2226,8 @@ class SprintyCombat(CombatHandler):
                                             break
                                     if is_enchant:
                                         break
-                            await to_cast.cast(target, sleep_time=self.config.cast_time*2)
-                            while await self.get_num_card_windows() == card_count:
-                                await asyncio.sleep(0.1)
+                            if not await self._fuse_enchant(to_cast, target, recast=False):
+                                return False
                             self.cur_card_count -= 1
                             await asyncio.sleep(self.config.cast_time) # give it some time for card list to update
                         break
@@ -2116,6 +2246,81 @@ class SprintyCombat(CombatHandler):
         except wizwalker.errors.WizWalkerMemoryError or ValueError:
             pass # Let it happen if it happens
         return True
+
+    async def _fuse_enchant(self, enchant_card: CombatCard, onto: CombatCard, *, recast: bool) -> bool:
+        """Cast an enchant onto a card in hand and wait for the two to fuse.
+
+        The fuse shows as the hand shrinking by one. With `recast` the click is
+        repeated until it does, for a click the client dropped. False after
+        `ENCHANT_TIMEOUT`, when the game has refused the enchant on that card.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + ENCHANT_TIMEOUT
+        before = len(await self.get_cards())
+        await enchant_card.cast(onto, sleep_time=self.config.cast_time*2)
+        while True:
+            await asyncio.sleep(self.config.cast_time*2 if recast else 0.1)
+            if len(await self.get_cards()) != before:
+                return True
+            if loop.time() >= deadline:
+                break
+            if recast:
+                await enchant_card.cast(onto, sleep_time=self.config.cast_time*2)
+        try:
+            names = f"{await enchant_card.name()} onto {await onto.name()}"
+        except Exception:
+            names = "an enchant"
+        logger.warning("%s did not fuse within %.0f s; skipping it", names, ENCHANT_TIMEOUT)
+        return False
+
+    async def _walk_priorities(self, priorities: List[MoveConfig]) -> None:
+        """Cast the round's card, running held enchant slots first when it is not an attack.
+
+        An enchant-only slot (`is_enchant_only`) never ends the turn, so it is
+        held when the walk reaches it, if its condition holds, and the walk goes
+        on. When the card the walk picks attacks, the held slots are dropped and
+        the hand is left as it is. Otherwise, and before a pass, they run, and
+        the walk starts again from the top: an enchant can fuse the very card
+        that was picked. They run at most once a round, so the second walk
+        always ends in a cast or a pass.
+        """
+        enchanted = False
+        while True:
+            self.held_enchants = []
+            restart = False
+            for p in priorities:
+                if is_enchant_only(p):
+                    if not enchanted and (p.condition is None or await self.evaluate_condition(p.condition)):
+                        self.held_enchants.append(p)
+                    continue
+                resp = await self.try_execute_config(p)
+                if resp is RESTART:
+                    restart = True
+                    break
+                if resp:
+                    self.held_enchants = []
+                    return
+            else:
+                # Nothing castable. The enchants still free slots for the
+                # refill, and a fused card may be castable where its parts were not.
+                restart = bool(self.held_enchants)
+            if not restart:
+                await self.pass_button()
+                return
+            await self._run_held_enchants()
+            enchanted = True
+
+    async def _run_held_enchants(self) -> None:
+        held, self.held_enchants = self.held_enchants, []
+        for slot in held:
+            # Its condition was read when the walk reached it.
+            await self.try_execute_config(MoveConfig(slot.move, slot.target))
+
+    async def _read_max_hand_size(self, member: CombatMember) -> Optional[int]:
+        try:
+            return await (await member.get_participant()).max_hand_size()
+        except Exception:
+            return None
 
     async def fail_turn(self):
         self.turn_adjust -= 1
@@ -2137,7 +2342,9 @@ class SprintyCombat(CombatHandler):
             _dbg_names = [await c.name() for c in _dbg_castable]
             _dbg(f"[MT-DBG] castable cards: {_dbg_names}")
             await self._inspect_deck_once()
-            self.cur_card_count = len(await self.get_cards()) + (await self.get_card_counts())[0]
+            # Read before anything is cast: whether the refill filled the hand.
+            self.round_start_hand = len(await self.get_cards())
+            self.cur_card_count = self.round_start_hand + (await self.get_card_counts())[0]
                 
             if not self.had_first_round:
                 current_round = real_round - 1
@@ -2161,6 +2368,8 @@ class SprintyCombat(CombatHandler):
                 await self.fail_turn() # This is quite catastrophic. Use default fail for now
             
             if member is not None:
+                if self.max_hand_size is None:
+                    self.max_hand_size = await self._read_max_hand_size(member)
                 if await member.is_stunned():
                     await self.fail_turn()
                 else:
@@ -2170,11 +2379,7 @@ class SprintyCombat(CombatHandler):
                     else:
                         self.rel_round_offset -= 1
                     if round_config is not None:
-                        for p in round_config.priorities:  # go through rounds priorities
-                            if await self.try_execute_config(p):
-                                break  # we found a working priority and managed to cast it
-                        else:
-                            await self.pass_button()
+                        await self._walk_priorities(round_config.priorities)
                     else:  # Very bad. Probably using empty config
                         await self.config.handle_no_cards_given()
 

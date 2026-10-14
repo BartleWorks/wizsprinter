@@ -99,6 +99,27 @@ in an aggregation function:
 
 Note: `allies` includes yourself (the client wizard).
 
+### Your deck
+
+`deck` is not a combatant. It reads one attribute, `remaining`: the cards left
+in your **main** pile, the one the hand refills from at the start of each round.
+
+```
+?(deck.remaining >= 2) sharp @ spell(any<blade>) & potent @ spell(any<trap>) | ...
+```
+
+The game's `Cards  13 of 20` label counts the treasure pile too, and nothing on
+the client counts the main pile alone. So `remaining` is the label's first
+number, except that a hand that **began the round short of full** means the
+refill ran out, and the main pile is empty: `0`.
+
+- Without treasure cards in the deck, `remaining` is exact.
+- With them, it overcounts by the treasure cards left until the main pile first
+  runs short; from that round on it reads `0`.
+- The label is read by its numbers alone, so any client language works.
+
+`deck.remaining` takes no `%`, and `deck.<anything else>` is false.
+
 ## Attributes
 
 ### Member attributes
@@ -161,6 +182,41 @@ Disposition matching follows the game's logic: an effect with disposition
 - **Percentage**: `50%` -- computes `(current / max) * 100` using the
   corresponding `max_` attribute (e.g. `health` uses `max_health`).
   Only works for attributes that have a `max_` counterpart (see table above).
+
+## Enchanting ahead: slots that are held
+
+A priority made only of moves aimed at a card in hand, `X @ spell(Y)`, never
+ends the turn: fusing an enchant into a card is free. Fusing also frees a hand
+slot, which the next refill draws into, so enchanting ahead of time cycles a
+large deck faster.
+
+Such a priority is **held** rather than run where it stands:
+
+1. The walk down the `|` chain reaches it. If its condition holds, it is noted,
+   and the walk goes on.
+2. The walk picks the card it will cast. If that card **attacks** -- any damage
+   effect aimed at an enemy, damage over time and health steals included -- the
+   held slot is dropped and the hand is left as it is. The attack's own
+   `[...]` enchant still applies.
+3. Otherwise, and before a `pass` or a round where nothing can be cast, the held
+   slot runs, and the walk starts again from the top. An enchant can fuse the
+   very card that was picked, so it is found again the ordinary way.
+
+A held slot runs at most once a round, so the second walk always ends in a cast
+or a pass. It covers only the casts below it: put it first.
+
+```
+?(deck.remaining >= 2) any<mod_damage> @ spell(any<damage & aoe>) & any<mod_damage> @ spell(any<damage>)
+  & sharp @ spell(any<blade>) & potent @ spell(any<trap>)
+| any<trap>[potent] @ enemy | any<blade>[sharp] @ self | any<damage>[any<mod_damage>] @ enemy
+```
+
+`discard @ spell(...)` is not an enchant, and a chain that ends in a real cast
+(`sharp @ spell(any<blade>) & any<blade> @ self`) is an ordinary priority, run
+where it stands as before.
+
+An enchant the game refuses on a card does nothing at all, so the fuse is
+waited for for at most 5 seconds (`ENCHANT_TIMEOUT`), then skipped and logged.
 
 ## Spell type: `req_met`
 
@@ -513,6 +569,8 @@ All condition failures silently skip the priority (return false):
 - **`req_met` evaluation failure**: card has no conditional effects (passes),
   or requirement evaluation throws (treated as not met, skips card)
 - **Any other exception**: caught and treated as false
+- **Deck label unreadable**: `deck.remaining` reads `0`, as the label's
+  reader does after its 2 second wait
 
 This means conditions are always safe -- they never crash the bot. A
 condition that can't be evaluated just skips that priority.
