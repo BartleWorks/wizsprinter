@@ -41,6 +41,13 @@ def _dbg(msg: str) -> None:
 
 logger = logging.getLogger(__name__)
 
+#: What a turn decided and why, at DEBUG: the hand each round began with, every
+#: priority walked and why it was passed over, every fuse with the hand on either
+#: side of it, which card was then cast and at whom. Off unless the application
+#: enables this logger. A combatant is named by its seat, never its name, since
+#: a player's is a wizard's name.
+turn_logger = logging.getLogger("wizwalker.extensions.wizsprinter.turns")
+
 
 async def _flatten_effect(effect, out: List, depth: int = 0):
     """Recursively unwrap container effects (Compound/EffectList, Conditional,
@@ -761,8 +768,16 @@ async def card_is_multi_target(card: CombatCard) -> bool:
 
 
 class SprintyCombat(CombatHandler):
-    def __init__(self, client: wizwalker.client.Client, config_provider: BaseCombatBackend, handle_mouseless: bool = False):
+    def __init__(
+        self,
+        client: wizwalker.client.Client,
+        config_provider: BaseCombatBackend,
+        handle_mouseless: bool = False,
+        log_tag: str = "",
+    ):
         super().__init__(client)
+        # Starts every turn_logger line, to tell the clients of one fight apart.
+        self.log_tag = log_tag
         self.client: wizwalker.client.Client = client # to restore autocomplete
         self.config = config_provider
         self.turn_adjust = 0
@@ -791,6 +806,101 @@ class SprintyCombat(CombatHandler):
         self.held_enchants = []
         self._did_deck_inspect = False  # one-shot deck dump per fight
         await super().handle_combat()
+
+    # --- The turn trace ----------------------------------------------------
+    # Each describer reads what it can and never raises: a trace must not be
+    # what breaks a turn.
+
+    @property
+    def tracing(self) -> bool:
+        return turn_logger.isEnabledFor(logging.DEBUG)
+
+    def trace(self, msg: str, *args) -> None:
+        if self.tracing:
+            turn_logger.debug("%s" + msg, self.log_tag and self.log_tag + " ", *args)
+
+    @staticmethod
+    async def describe_card(card: CombatCard) -> str:
+        """`Storm Blade (template 123, enchant 456)`, as the card's slot reads now."""
+        try:
+            name = await card.name()
+        except Exception:
+            return "<unreadable card>"
+        ids = []
+        try:
+            ids.append(f"template {await card.template_id()}")
+        except Exception:
+            pass
+        try:
+            enchant = await (await card.get_graphical_spell()).enchantment()
+            if enchant:
+                ids.append(f"enchant {enchant}")
+        except Exception:
+            pass
+        try:
+            if not await card.is_castable():
+                ids.append("grayed")
+        except Exception:
+            pass
+        return f"{name} ({', '.join(ids)})" if ids else name
+
+    async def describe_hand(self, cards: Optional[List[CombatCard]] = None) -> str:
+        try:
+            cards = await self.get_cards() if cards is None else cards
+        except Exception:
+            return "<unreadable hand>"
+        if not cards:
+            return "empty"
+        return " | ".join([f"{i}: {await self.describe_card(c)}" for i, c in enumerate(cards, 1)])
+
+    @staticmethod
+    def _same_slot(a: CombatCard, b: CombatCard) -> bool:
+        if a is b:
+            return True
+        wa, wb = getattr(a, "_spell_window", None), getattr(b, "_spell_window", None)
+        if wa is None or wb is None:
+            return False
+        return getattr(wa, "base_address", None) == getattr(wb, "base_address", object())
+
+    async def slot_of(self, card: CombatCard) -> Optional[int]:
+        """The card's 1-based place in the hand as it reads now, or None once it has left."""
+        try:
+            for i, c in enumerate(await self.get_cards(), 1):
+                if self._same_slot(c, card):
+                    return i
+        except Exception:
+            pass
+        return None
+
+    async def describe_target(self, target) -> str:
+        """Who or what a move is cast at, by seat: `self`, `team seat 2`, `enemy seat 1 (boss)`."""
+        if target is None:
+            return "no target"
+        if isinstance(target, list):
+            return ", ".join([await self.describe_target(t) for t in target]) or "nobody"
+        if isinstance(target, CombatCard):
+            return await self.describe_card(target)
+        if isinstance(target, Spell):
+            return "a card in hand"
+        if isinstance(target, str):
+            return target
+        try:
+            owner = await (await target.get_participant()).owner_id_full()
+
+            async def owner_of(m):
+                return await (await m.get_participant()).owner_id_full()
+
+            if owner == await owner_of(await self.get_client_member()):
+                return "self"
+            for i, m in enumerate(await self.get_team(), 1):
+                if await owner_of(m) == owner:
+                    return f"team seat {i}"
+            for i, m in enumerate(await self.get_enemies(), 1):
+                if await owner_of(m) == owner:
+                    return f"enemy seat {i}" + (" (boss)" if await m.is_boss() else "")
+        except Exception:
+            pass
+        return "<unreadable combatant>"
 
     async def get_member_named(self, name: str) -> Optional[CombatMember]:
         # Issue: #4
@@ -2039,6 +2149,7 @@ class SprintyCombat(CombatHandler):
         _dbg(f"[COND-DBG] try_execute_config: condition={move_config.condition}, move={move_config.move}")
         if move_config.condition is not None:
             if not await self.evaluate_condition(move_config.condition):
+                self.trace("  condition false: %s", move_config.condition)
                 return False
 
         if type(move_config.move) is list and type(move_config.target) is list:
@@ -2109,6 +2220,7 @@ class SprintyCombat(CombatHandler):
 
         if target == False:  # Wouldn't want a None to mess it up
             _dbg(f"[MT-DBG] target is False for {move_config.target}")
+            self.trace("  no such target: %s", move_config.target)
             return False
 
         # A card aimed at a spell is itself an enchant or discard, not the cast,
@@ -2132,6 +2244,7 @@ class SprintyCombat(CombatHandler):
             )
             if not candidates:
                 _dbg(f"[MT-DBG] no candidates for {move_config.move.card}")
+                self.trace("  no castable card matches %s", move_config.move.card)
                 return False
         else:
             single = await self.try_get_spell(
@@ -2140,12 +2253,15 @@ class SprintyCombat(CombatHandler):
             )
             if single is None:
                 _dbg(f"[MT-DBG] cur_card is None for {move_config.move.card}")
+                self.trace("  no castable card matches %s", move_config.move.card)
                 return False
-            
+
             if single == "pass":
                 if self.held_enchants:
                     # Enchant before giving the turn up: the freed slots refill.
+                    self.trace("  pass: running the held enchants first")
                     return RESTART
+                self.trace("  pass")
                 await self.pass_button()
                 return True
             
@@ -2189,10 +2305,18 @@ class SprintyCombat(CombatHandler):
             if await card_requires_target_selection(cand):
                 if ttype in (TargetType.type_aoe, TargetType.type_self, TargetType.type_ally):
                     _dbg(f"[MT-DBG] target_selection rejected: ttype={ttype}, card={await cand.name()}")
+                    if self.tracing:
+                        self.trace("  skip %s: it needs a target picked, and the move is @ %s",
+                                   await self.describe_card(cand), ttype)
                     continue
             if needs_req_met and not await self.card_requirements_met(cand, req_member):
+                if self.tracing:
+                    self.trace("  skip %s: its requirements are not met", await self.describe_card(cand))
                 continue
             if needs_stacks and not await self.would_stack(cand, target, enchant_card):
+                if self.tracing:
+                    self.trace("  skip %s: it would not stack on %s",
+                               await self.describe_card(cand), await self.describe_target(target))
                 continue
             # All declared gambit/clear specs must hold simultaneously.
             failed_spec = False
@@ -2201,12 +2325,16 @@ class SprintyCombat(CombatHandler):
                     failed_spec = True
                     break
             if failed_spec:
+                if self.tracing:
+                    self.trace("  skip %s: a gambit, clear or echo does not hold", await self.describe_card(cand))
                 continue
             for spec in swap_specs:
                 if not await self.card_matches_swap(cand, spec):
                     failed_spec = True
                     break
             if failed_spec:
+                if self.tracing:
+                    self.trace("  skip %s: a swap does not hold", await self.describe_card(cand))
                 continue
             cur_card = cand
             break
@@ -2216,13 +2344,20 @@ class SprintyCombat(CombatHandler):
                 _dbg(f"[REQ-DBG] no candidate passed post-filters for {move_config.move.card}")
             return False
 
+        if self.tracing:
+            self.trace("  picked %s (slot %s) for %s", await self.describe_card(cur_card),
+                       await self.slot_of(cur_card), await self.describe_target(target))
+
         # The round's card is picked. Held enchants run first unless it attacks;
         # an attack keeps its hand as it is and takes its own `[...]` enchant.
         if self.held_enchants and not aims_at_spell:
             if await card_is_attack(cur_card):
                 _dbg(f"[HOLD-DBG] {await cur_card.name()} attacks; held enchants dropped")
+                self.trace("  it attacks: %d held enchant slot(s) dropped", len(self.held_enchants))
                 self.held_enchants = []
             else:
+                self.trace("  it does not attack: running %d held enchant slot(s), then walking again",
+                           len(self.held_enchants))
                 return RESTART
 
         # Multi-target spell — wrap single target in list for confirm button flow.
@@ -2256,6 +2391,9 @@ class SprintyCombat(CombatHandler):
                 if enchant_card is not None:
                     previous_cards = await self.get_cards()
                     previous_card_names = Counter([await card.name() for card in previous_cards])
+                    # Described now: a card handle reads its slot as it is, so after the fuse
+                    # these would show the new hand.
+                    hand_before = await self.describe_hand(previous_cards) if self.tracing else ""
                     # A refused enchant leaves the card bare; only a mandatory
                     # one fails the clause.
                     if not await self._fuse_enchant(enchant_card, cur_card, recast=True):
@@ -2267,6 +2405,10 @@ class SprintyCombat(CombatHandler):
                     new_cards = await self.get_cards()
                     new_card_names = Counter([await card.name() for card in new_cards])
                     diff = list(new_card_names - previous_card_names)
+                    if self.tracing:
+                        self.trace("  fused the move's enchant. Hand before: %s", hand_before)
+                        self.trace("  hand after: %s", await self.describe_hand(new_cards))
+                        self.trace("  names new to the hand: %s", diff or "none")
                     if diff:
                         cur_card = await self.try_get_spell(NamedSpell(name=diff[0], is_literal=True), only_enchantable=only_enchantable)
                         if move_config.move.second_enchant:
@@ -2292,14 +2434,21 @@ class SprintyCombat(CombatHandler):
         to_cast = None
         if fused:
             to_cast = await self.try_get_spell(NamedSpell(name=fused, is_literal=True))
+            source = f"found by the fused card's new name {fused!r}"
         elif needs_post_filter:
             # Use the cur_card we picked above — try_get_spell would return the
             # first template match, which may not be the one that passed our filters.
             to_cast = cur_card
+            source = "the card picked before any fuse"
         else:
             to_cast = await self.try_get_spell(move_config.move.card, only_enchants=aims_at_spell)
+            source = "the move's card looked up again"
         if to_cast is None:
+            self.trace("  nothing to cast (%s)", source)
             return False  # this should not happen
+        if self.tracing:
+            self.trace("  to cast: %s (slot %s), %s", await self.describe_card(to_cast),
+                       await self.slot_of(to_cast), source)
         
         # Issue: 5. Casting wasn't that reliable
         try:
@@ -2333,11 +2482,21 @@ class SprintyCombat(CombatHandler):
                                             break
                                     if is_enchant:
                                         break
+                            if self.tracing:
+                                self.trace("  enchant %s onto %s", await self.describe_card(to_cast),
+                                           await self.describe_card(target))
                             if not await self._fuse_enchant(to_cast, target, recast=False):
                                 return False
                             self.cur_card_count -= 1
                             await asyncio.sleep(self.config.cast_time) # give it some time for card list to update
+                            if self.tracing:
+                                self.trace("  hand after: %s", await self.describe_hand())
+                        else:
+                            self.trace("  no card in hand to enchant")
                         break
+                    if self.tracing:
+                        self.trace("  cast %s (slot %s) at %s", await self.describe_card(to_cast),
+                                   await self.slot_of(to_cast), await self.describe_target(target))
                     await to_cast.cast(target, sleep_time=self.config.cast_time*2)
                     await asyncio.sleep(self.config.cast_time) # give it some time for card list to update
                     if fused:
@@ -2364,15 +2523,27 @@ class SprintyCombat(CombatHandler):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + ENCHANT_TIMEOUT
         before = len(await self.get_cards())
+        if self.tracing:
+            self.trace("  fuse %s (slot %s) onto %s (slot %s), %d cards in hand",
+                       await self.describe_card(enchant_card), await self.slot_of(enchant_card),
+                       await self.describe_card(onto), await self.slot_of(onto), before)
         await enchant_card.cast(onto, sleep_time=self.config.cast_time*2)
+        clicks = 1
         while True:
             await asyncio.sleep(self.config.cast_time*2 if recast else 0.1)
-            if len(await self.get_cards()) != before:
+            now = len(await self.get_cards())
+            if now != before:
+                self.trace("  fused after %d click(s): %d cards in hand", clicks, now)
                 return True
             if loop.time() >= deadline:
                 break
             if recast:
+                if self.tracing:
+                    self.trace("  hand unchanged; clicking again: %s (slot %s) onto %s (slot %s)",
+                               await self.describe_card(enchant_card), await self.slot_of(enchant_card),
+                               await self.describe_card(onto), await self.slot_of(onto))
                 await enchant_card.cast(onto, sleep_time=self.config.cast_time*2)
+                clicks += 1
         try:
             names = f"{await enchant_card.name()} onto {await onto.name()}"
         except Exception:
@@ -2395,16 +2566,23 @@ class SprintyCombat(CombatHandler):
         while True:
             self.held_enchants = []
             restart = False
-            for p in priorities:
+            for n, p in enumerate(priorities, 1):
                 if is_enchant_only(p):
-                    if not enchanted and (p.condition is None or await self.evaluate_condition(p.condition)):
+                    if enchanted:
+                        self.trace("#%d: enchant only; already run this round", n)
+                    elif p.condition is None or await self.evaluate_condition(p.condition):
+                        self.trace("#%d: enchant only; held", n)
                         self.held_enchants.append(p)
+                    else:
+                        self.trace("#%d: enchant only; condition false: %s", n, p.condition)
                     continue
+                self.trace("#%d:", n)
                 resp = await self.try_execute_config(p)
                 if resp is RESTART:
                     restart = True
                     break
                 if resp:
+                    self.trace("#%d ended the turn", n)
                     self.held_enchants = []
                     return
             else:
@@ -2412,15 +2590,19 @@ class SprintyCombat(CombatHandler):
                 # refill, and a fused card may be castable where its parts were not.
                 restart = bool(self.held_enchants)
             if not restart:
+                self.trace("nothing castable: pass")
                 await self.pass_button()
                 return
             await self._run_held_enchants()
             enchanted = True
+            if self.tracing:
+                self.trace("held enchants run; walking again. Hand: %s", await self.describe_hand())
 
     async def _run_held_enchants(self) -> None:
         held, self.held_enchants = self.held_enchants, []
-        for slot in held:
+        for n, slot in enumerate(held, 1):
             # Its condition was read when the walk reached it.
+            self.trace("held enchant slot %d of %d:", n, len(held))
             await self.try_execute_config(MoveConfig(slot.move, slot.target))
 
     async def _read_max_hand_size(self, member: CombatMember) -> Optional[int]:
@@ -2459,6 +2641,7 @@ class SprintyCombat(CombatHandler):
                     self.turn_adjust -= current_round
             else:
                 if self.cur_card_count >= self.prev_card_count and not self.was_pass:
+                    self.trace("round %d: no card left the hand last round; counted as a fizzle", real_round)
                     await self.on_fizzle()
             self.was_pass = False
             current_round = (real_round - 1 + self.turn_adjust + self.rel_round_offset)
@@ -2478,13 +2661,21 @@ class SprintyCombat(CombatHandler):
                 if self.max_hand_size is None:
                     self.max_hand_size = await self._read_max_hand_size(member)
                 if await member.is_stunned():
+                    self.trace("round %d: stunned, passing", real_round)
                     await self.fail_turn()
                 else:
                     round_config = await self.config.get_real_round(real_round)
                     if round_config is None:
                         round_config = await self.config.get_relative_round(current_round)
+                        line = f"the line for relative round {current_round}"
                     else:
                         self.rel_round_offset -= 1
+                        line = f"the {{{real_round}}} line"
+                    if self.tracing:
+                        self.trace("round %d, %s; deck.remaining %d, hand %d of %s: %s",
+                                   real_round, line if round_config is not None else "no line",
+                                   await self.deck_remaining(), self.round_start_hand,
+                                   self.max_hand_size, await self.describe_hand())
                     if round_config is not None:
                         await self._walk_priorities(round_config.priorities)
                     else:  # Very bad. Probably using empty config
