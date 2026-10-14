@@ -15,7 +15,7 @@ from wizwalker.memory.memory_objects.conditionals import charm_effect_types, war
 from .combat_backends.combat_config_parser import TargetType, TargetData, MoveConfig, TemplateSpell \
     , NamedSpell, SpellType, Spell, DrawSpell, Condition, AllCondition, ConditionTarget, ComparisonOp, AggregationMode \
     , GambitSpec, ClearSpec, EchoSpec, SwapSpec, NotTypeSpec, ExcludeNameSpec, HangingType, HANGING_CATEGORIES \
-    , hanging_type_info
+    , hanging_type_info, POST_FILTER_TYPES
 from wizwalker.memory.memory_objects.conditionals import ReqHangingAura
 from .combat_backends.backend_base import BaseCombatBackend
 from .combat_backends.spell_ranking import (
@@ -343,6 +343,15 @@ async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template:
             target is EffectTarget.self,
             rounds > 0,
         ))
+
+    def is_harmful_aura() -> bool:
+        # Attenuate: +20% incoming damage, enemy_single, four rounds. A trap or a
+        # charm has no rounds, so neither predicate takes it.
+        return all((
+            eff_type in charm_effects.union(ward_effects),
+            target in enemy_targets,
+            rounds > 0,
+        ))
     
     def is_global() -> bool:
         return all((
@@ -425,6 +434,9 @@ async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template:
         case SpellType.type_aura:
             is_satisfied = is_aura()
 
+        case SpellType.type_harmful_aura:
+            is_satisfied = is_harmful_aura()
+
         case SpellType.type_global:
             is_satisfied = is_global()
         
@@ -488,12 +500,12 @@ async def card_is_excluded(card: CombatCard, effects: List[DynamicSpellEffect], 
 async def does_card_contain_reqs(card: CombatCard, template: TemplateSpell) -> bool:
     effects = await get_inner_card_effects(card)
     is_aoe_req = SpellType.type_aoe in template.requirements
-    # req_met / stacks / gambit() / clear() / echo() / swap() are meta-filters
-    # checked post-selection, not per-effect. The negations are checked here, but
-    # reject rather than count toward a match.
+    # req_met / stacks / stronger / gambit() / clear() / echo() / swap() are
+    # meta-filters checked post-selection, not per-effect. The negations are
+    # checked here, but reject rather than count toward a match.
     reqs_to_check = [
         r for r in template.requirements
-        if r not in (SpellType.type_req_met, SpellType.type_stacks)
+        if r not in POST_FILTER_TYPES
         and not isinstance(r, (GambitSpec, ClearSpec, EchoSpec, SwapSpec, NotTypeSpec, ExcludeNameSpec))
     ]
     if await card_is_excluded(card, effects, template):
@@ -2103,7 +2115,7 @@ class SprintyCombat(CombatHandler):
     #: leaves on its caster is none of these, so it is never what decides.
     _STACKING_KINDS = (
         SpellType.type_blade, SpellType.type_charm, SpellType.type_ward,
-        SpellType.type_trap, SpellType.type_aura,
+        SpellType.type_trap, SpellType.type_aura, SpellType.type_harmful_aura,
     )
 
     async def would_stack(self, card: CombatCard, target, enchant=None) -> bool:
@@ -2144,6 +2156,81 @@ class SprintyCombat(CombatHandler):
                 if (spell_id, enchant_id) not in held[id(member)]:
                     return True
         return not saw_any
+
+    #: How an aura effect's param reads for whoever holds it: positive helps the
+    #: holder. More incoming damage hurts, more outgoing damage or healing helps.
+    _AURA_SIGN = {
+        SpellEffects.modify_incoming_damage: -1,
+        SpellEffects.modify_incoming_damage_flat: -1,
+        SpellEffects.modify_incoming_damage_over_time: -1,
+        SpellEffects.modify_incoming_armor_piercing: -1,
+        SpellEffects.modify_outgoing_damage: 1,
+        SpellEffects.modify_outgoing_damage_flat: 1,
+        SpellEffects.modify_outgoing_armor_piercing: 1,
+        SpellEffects.modify_outgoing_heal: 1,
+        SpellEffects.modify_outgoing_heal_flat: 1,
+        SpellEffects.modify_incoming_heal: 1,
+        SpellEffects.modify_incoming_heal_flat: 1,
+        SpellEffects.modify_incoming_heal_over_time: 1,
+    }
+
+    @classmethod
+    async def _aura_value(cls, effects) -> int:
+        """What an aura is worth to whoever holds it: its strongest effect, signed.
+
+        Positive helps the holder. Only the strongest effect counts, as a buff's
+        best effect does in `spell_ranking`: Typhoon Attenuate's +35% Death and +35%
+        Storm on a boss read -35, and Frenzy's +40% outgoing and +30% incoming read
+        +40, so Frenzy counts as the positive aura it is. Zero for no effects.
+        """
+        best = 0
+        for effect in effects:
+            sign = cls._AURA_SIGN.get(await effect.effect_type(), 0)
+            value = sign * await effect.effect_param()
+            if abs(value) > abs(best):
+                best = value
+        return best
+
+    async def would_replace(self, card: CombatCard, target) -> bool:
+        """Whether the aura `card` leaves is better for the caster's side than the
+        aura its landing participant already holds.
+
+        A participant holds one aura, and a new one replaces it, so a negative aura
+        replaces a boss's own Frenzy and a stronger negative one replaces a weaker.
+        Both auras are read for our side: what helps an enemy counts against us. A
+        card that leaves no aura, an aura that can't be read and a landing that can't
+        be told all pass, as `stacks` lets through what it can't see.
+        """
+        empty = TemplateSpell([])
+        try:
+            effects = await get_inner_card_effects(card)
+            auras = []
+            for effect in effects:
+                kinds = [await is_req_satisfied(effect, kind, empty)
+                         for kind in (SpellType.type_aura, SpellType.type_harmful_aura)]
+                if ReqSatisfaction.true in kinds:
+                    auras.append(effect)
+            if not auras:
+                return True
+            on_enemy = await auras[0].effect_target() in enemy_targets
+            members = await self._landing_members(await auras[0].effect_target(), target)
+            ours = -1 if on_enemy else 1
+            card_value = ours * await self._aura_value(auras)
+        except Exception as e:
+            _dbg(f"[REQ-DBG] stronger: card unreadable, passing it ({type(e).__name__}: {e})")
+            return True
+        if not members:
+            return True
+        for member in members:
+            try:
+                held = await (await member.get_participant()).aura_effects()
+                held_value = ours * await self._aura_value(held)
+            except Exception as e:
+                _dbg(f"[REQ-DBG] stronger: aura unreadable, passing ({type(e).__name__}: {e})")
+                return True
+            if card_value > held_value:
+                return True
+        return False
 
     async def try_execute_config(self, move_config: MoveConfig, willcasted: bool = False) -> bool | Tuple[bool, bool]:
         _dbg(f"[COND-DBG] try_execute_config: condition={move_config.condition}, move={move_config.move}")
@@ -2214,7 +2301,10 @@ class SprintyCombat(CombatHandler):
             if is_template else []
         )
         needs_stacks = is_template and SpellType.type_stacks in move_config.move.card.requirements
-        needs_post_filter = needs_req_met or needs_stacks or bool(gambit_clear_specs) or bool(swap_specs)
+        needs_stronger = is_template and SpellType.type_stronger in move_config.move.card.requirements
+        needs_post_filter = (
+            needs_req_met or needs_stacks or needs_stronger or bool(gambit_clear_specs) or bool(swap_specs)
+        )
 
         target = await self.try_get_config_target(move_config.target)
 
@@ -2316,6 +2406,11 @@ class SprintyCombat(CombatHandler):
             if needs_stacks and not await self.would_stack(cand, target, enchant_card):
                 if self.tracing:
                     self.trace("  skip %s: it would not stack on %s",
+                               await self.describe_card(cand), await self.describe_target(target))
+                continue
+            if needs_stronger and not await self.would_replace(cand, target):
+                if self.tracing:
+                    self.trace("  skip %s: the aura on %s is as strong",
                                await self.describe_card(cand), await self.describe_target(target))
                 continue
             # All declared gambit/clear specs must hold simultaneously.

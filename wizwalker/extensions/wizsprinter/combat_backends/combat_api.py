@@ -55,6 +55,18 @@ class SpellType(Enum):
     # Whether the effect the card leaves would add to its target's, rather than
     # duplicate one already hanging there. Checked after selection, like req_met.
     type_stacks = auto()
+    # An aura cast at an enemy: an effect lasting rounds whose target is an enemy.
+    # `aura` stays an aura on the caster.
+    type_harmful_aura = auto()
+    # Whether the aura the card leaves is better for the caster's side than the
+    # aura its landing participant already holds. Checked after selection.
+    type_stronger = auto()
+
+
+#: Requirements checked after a card is selected rather than against each of its
+#: effects, so a negation of one has nothing to test and a card's effects never
+#: count toward them.
+POST_FILTER_TYPES = (SpellType.type_req_met, SpellType.type_stacks, SpellType.type_stronger)
 
 
 class ComparisonOp(Enum):

@@ -84,7 +84,7 @@ def get_sprinty_grammar():
             neg_type.2: _not spell_type
             neg_name: _not (words | string)
             _not: _spaced{"!"}
-            spell_type: spell_damage | spell_aoe | spell_heal_self | spell_heal_other | spell_heal | spell_blade | spell_charm | spell_ward | spell_trap | spell_enchant | spell_aura | spell_global | spell_polymorph | spell_shadow | spell_shadow_creature | spell_pierce | spell_prism | spell_dispel | spell_inc_damage | spell_out_damage | spell_inc_heal | spell_out_heal | spell_mod_damage | spell_mod_heal | spell_mod_pierce | spell_req_met | spell_stacks | spell_gambit | spell_clear | spell_echo | spell_swap
+            spell_type: spell_damage | spell_aoe | spell_heal_self | spell_heal_other | spell_heal | spell_blade | spell_charm | spell_ward | spell_trap | spell_enchant | spell_aura | spell_harmful_aura | spell_global | spell_polymorph | spell_shadow | spell_shadow_creature | spell_pierce | spell_prism | spell_dispel | spell_inc_damage | spell_out_damage | spell_inc_heal | spell_out_heal | spell_mod_damage | spell_mod_heal | spell_mod_pierce | spell_req_met | spell_stacks | spell_stronger | spell_gambit | spell_clear | spell_echo | spell_swap
             spell_damage: _spaced{"damage"}
             spell_aoe: _spaced{"aoe"}
             spell_heal: _spaced{"heal"}
@@ -96,6 +96,7 @@ def get_sprinty_grammar():
             spell_trap: _spaced{"trap"}
             spell_enchant: _spaced{"enchant"}
             spell_aura: _spaced{"aura"}
+            spell_harmful_aura: _spaced{"harmful_aura"}
             spell_global: _spaced{"global"}
             spell_polymorph: _spaced{"polymorph"}
             spell_shadow: _spaced{"shadow"}
@@ -112,6 +113,7 @@ def get_sprinty_grammar():
             spell_mod_pierce: _spaced{"mod_pierce"}
             spell_req_met: _spaced{"req_met"}
             spell_stacks: _spaced{"stacks"}
+            spell_stronger: _spaced{"stronger"}
             spell_gambit: _spaced{"gambit"} _open_paren hanging_args _close_paren
             spell_clear:  _spaced{"clear"}  _open_paren hanging_args _close_paren
             spell_echo:   _spaced{"echo"}   _open_paren hanging_args _close_paren
@@ -378,9 +380,9 @@ class TreeToConfig(Transformer):
 
     def neg_type(self, items):
         spell_type = items[0]
-        # A hanging verb, req_met and stacks are checked after selection, not per
-        # effect, so there is nothing for a negation of one to test a card against.
-        if not isinstance(spell_type, SpellType) or spell_type in (SpellType.type_req_met, SpellType.type_stacks):
+        # A hanging verb, req_met, stacks and stronger are checked after selection,
+        # not per effect, so there is nothing for a negation of one to test a card against.
+        if not isinstance(spell_type, SpellType) or spell_type in POST_FILTER_TYPES:
             raise ValueError(f"Only a spell type can be negated inside any<...>, not {spell_type}")
         return NotTypeSpec(spell_type)
 
@@ -479,6 +481,12 @@ class TreeToConfig(Transformer):
 
     def spell_stacks(self, _):
         return SpellType.type_stacks
+
+    def spell_stronger(self, _):
+        return SpellType.type_stronger
+
+    def spell_harmful_aura(self, _):
+        return SpellType.type_harmful_aura
 
     _HANGING_KW_ALIASES = hanging_type_aliases()
 

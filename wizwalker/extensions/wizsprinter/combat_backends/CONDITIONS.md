@@ -278,10 +278,10 @@ through to the next `|` alternative.
   when the card can still take one, so `any<blade & stacks>[sharp]` passes a
   plain Stormblade onto a wizard holding a plain one. An already enchanted card
   counts with the enchant it carries.
-- **Where it lands.** A blade, weakness, shield or trap lands on the move's
-  target, and an aura on the caster. A mass card lands on every living member of
-  its side, and stacks while at least one of them lacks it.
-- **What counts.** Blades, weaknesses, shields, traps and auras. A drawback,
+- **Where it lands.** A blade, weakness, shield, trap or harmful aura lands on
+  the move's target, and an aura on the caster. A mass card lands on every living
+  member of its side, and stacks while at least one of them lacks it.
+- **What counts.** Blades, weaknesses, shields, traps, auras and harmful auras. A drawback,
   such as the trap Feint leaves on its own caster, does not decide anything. A
   card that leaves none of these (a hit, a heal, a global) has nothing to
   duplicate, and always passes.
@@ -289,6 +289,46 @@ through to the next `|` alternative.
   read never holds a card back, and neither does a card whose own ids can't be.
 
 `stacks` can't be negated: `!stacks` is a parse error, as `!req_met` is.
+
+## Spell type: `harmful_aura`
+
+`aura` is an aura on the caster: an effect that lasts rounds and targets the
+caster, such as Amplify, Stabilize or Mend. `harmful_aura` is the other kind,
+an effect that lasts rounds and targets an enemy. Attenuate is one: +20%
+incoming damage on its target for four rounds, which a hit doesn't use up, as
+it would a trap. A trap or a weakness has no rounds, so neither `trap` nor
+`charm` matches one.
+
+```
+any<harmful_aura & inc_damage> @ boss
+```
+
+Ranked as `inc_damage`, so Typhoon Attenuate (+35%) comes before Attenuate
+(+20%). The school of a school-specific one isn't read: Typhoon Attenuate's
+halves are Death and Storm, and it ranks first for a Fire hitter too.
+
+## Spell type: `stronger`
+
+A participant holds one aura, and a new one replaces it. A negative aura cast on
+a boss replaces the boss's own Frenzy, and a weak one replaces a strong one just
+as readily. `stronger` keeps only the aura cards that leave their landing
+participant better for the caster's side than the aura it already holds:
+
+```
+any<harmful_aura & inc_damage & stronger> @ boss
+?(self.beneficial_auras == 0) any<aura & inc_damage & stronger>
+```
+
+An aura is worth its strongest effect, signed for whoever holds it: more
+incoming damage hurts, more outgoing damage or healing helps. Frenzy's +40%
+outgoing and +30% incoming read +40, a positive aura. Both are then read for the
+caster's side, where what helps an enemy counts against us. So Attenuate passes
+onto a boss with no aura or with its own Frenzy, Typhoon Attenuate passes onto a
+boss holding Attenuate, and Attenuate fails onto a boss holding either.
+
+Like `stacks`, it is checked after selection. A card that leaves no aura passes,
+and so does one whose landing or whose target's aura can't be read.
+`!stronger` is a parse error.
 
 ## Examples
 
