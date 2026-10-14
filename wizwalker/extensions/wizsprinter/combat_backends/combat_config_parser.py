@@ -84,7 +84,7 @@ def get_sprinty_grammar():
             neg_type.2: _not spell_type
             neg_name: _not (words | string)
             _not: _spaced{"!"}
-            spell_type: spell_damage | spell_aoe | spell_heal_self | spell_heal_other | spell_heal | spell_blade | spell_charm | spell_ward | spell_trap | spell_enchant | spell_aura | spell_global | spell_polymorph | spell_shadow | spell_shadow_creature | spell_pierce | spell_prism | spell_dispel | spell_inc_damage | spell_out_damage | spell_inc_heal | spell_out_heal | spell_mod_damage | spell_mod_heal | spell_mod_pierce | spell_req_met | spell_gambit | spell_clear | spell_echo | spell_swap
+            spell_type: spell_damage | spell_aoe | spell_heal_self | spell_heal_other | spell_heal | spell_blade | spell_charm | spell_ward | spell_trap | spell_enchant | spell_aura | spell_global | spell_polymorph | spell_shadow | spell_shadow_creature | spell_pierce | spell_prism | spell_dispel | spell_inc_damage | spell_out_damage | spell_inc_heal | spell_out_heal | spell_mod_damage | spell_mod_heal | spell_mod_pierce | spell_req_met | spell_stacks | spell_gambit | spell_clear | spell_echo | spell_swap
             spell_damage: _spaced{"damage"}
             spell_aoe: _spaced{"aoe"}
             spell_heal: _spaced{"heal"}
@@ -111,6 +111,7 @@ def get_sprinty_grammar():
             spell_mod_heal: _spaced{"mod_heal"}
             spell_mod_pierce: _spaced{"mod_pierce"}
             spell_req_met: _spaced{"req_met"}
+            spell_stacks: _spaced{"stacks"}
             spell_gambit: _spaced{"gambit"} _open_paren hanging_args _close_paren
             spell_clear:  _spaced{"clear"}  _open_paren hanging_args _close_paren
             spell_echo:   _spaced{"echo"}   _open_paren hanging_args _close_paren
@@ -377,9 +378,9 @@ class TreeToConfig(Transformer):
 
     def neg_type(self, items):
         spell_type = items[0]
-        # A hanging verb and req_met are checked after selection, not per effect,
-        # so there is nothing for a negation of one to test a card against.
-        if not isinstance(spell_type, SpellType) or spell_type is SpellType.type_req_met:
+        # A hanging verb, req_met and stacks are checked after selection, not per
+        # effect, so there is nothing for a negation of one to test a card against.
+        if not isinstance(spell_type, SpellType) or spell_type in (SpellType.type_req_met, SpellType.type_stacks):
             raise ValueError(f"Only a spell type can be negated inside any<...>, not {spell_type}")
         return NotTypeSpec(spell_type)
 
@@ -475,6 +476,9 @@ class TreeToConfig(Transformer):
 
     def spell_req_met(self, _):
         return SpellType.type_req_met
+
+    def spell_stacks(self, _):
+        return SpellType.type_stacks
 
     _HANGING_KW_ALIASES = hanging_type_aliases()
 

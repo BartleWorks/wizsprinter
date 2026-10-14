@@ -52,6 +52,9 @@ class SpellType(Enum):
     type_mod_pierce = auto()
     #Card requirement filtering
     type_req_met = auto()
+    # Whether the effect the card leaves would add to its target's, rather than
+    # duplicate one already hanging there. Checked after selection, like req_met.
+    type_stacks = auto()
 
 
 class ComparisonOp(Enum):
@@ -265,8 +268,8 @@ class TemplateSpell(Spell):
     def __init__(self, requirements: List, optional=False) -> None:
         # `requirements` is a heterogeneous list of SpellType values plus optional
         # post-selection filter specs (GambitSpec / ClearSpec) and the negations
-        # (NotTypeSpec / ExcludeNameSpec). req_met stays as a SpellType sentinel so
-        # existing parsing keeps working.
+        # (NotTypeSpec / ExcludeNameSpec). req_met and stacks stay SpellType
+        # sentinels so existing parsing keeps working.
         self.requirements = requirements
         self.optional = optional
 

@@ -468,12 +468,12 @@ async def card_is_excluded(card: CombatCard, effects: List[DynamicSpellEffect], 
 async def does_card_contain_reqs(card: CombatCard, template: TemplateSpell) -> bool:
     effects = await get_inner_card_effects(card)
     is_aoe_req = SpellType.type_aoe in template.requirements
-    # req_met / gambit() / clear() / echo() / swap() are meta-filters checked
-    # post-selection, not per-effect. The negations are checked here, but reject
-    # rather than count toward a match.
+    # req_met / stacks / gambit() / clear() / echo() / swap() are meta-filters
+    # checked post-selection, not per-effect. The negations are checked here, but
+    # reject rather than count toward a match.
     reqs_to_check = [
         r for r in template.requirements
-        if r is not SpellType.type_req_met
+        if r not in (SpellType.type_req_met, SpellType.type_stacks)
         and not isinstance(r, (GambitSpec, ClearSpec, EchoSpec, SwapSpec, NotTypeSpec, ExcludeNameSpec))
     ]
     if await card_is_excluded(card, effects, template):
@@ -1935,6 +1935,93 @@ class SprintyCombat(CombatHandler):
             _dbg(f"[REQ-DBG] swap EXCEPTION: {type(e).__name__}: {e}")
             return False
 
+    async def _landing_members(self, effect_target: EffectTarget, target) -> List[CombatMember]:
+        """Who an effect of a card cast at `target` ends up hanging on.
+
+        A team effect lands on every living member of that side, whoever the move
+        names; a self effect on the caster; anything else on the move's target.
+        Empty when that can't be told, as for a single-target effect cast `@ aoe`.
+        """
+        if effect_target in (EffectTarget.enemy_team, EffectTarget.enemy_team_all_at_once):
+            return await self.get_living_enemies()
+        if effect_target in (EffectTarget.friendly_team, EffectTarget.friendly_team_all_at_once):
+            return [m for m in await self.get_team() if await self._is_alive(m)]
+        if effect_target is EffectTarget.self:
+            return [await self.get_client_member()]
+        if isinstance(target, list):
+            return [m for m in target if not isinstance(m, Spell)]
+        if target is None or isinstance(target, Spell):
+            return []
+        return [target]
+
+    @staticmethod
+    async def _hanging_ids(member: CombatMember) -> Set[Tuple[int, int]]:
+        """(spell template id, enchant template id) of every effect hanging on a member.
+
+        An effect that can't be read is left out, so it matches nothing: a card is
+        never held back by what couldn't be seen, as an unreadable flag never is.
+        """
+        ids = set()
+        try:
+            participant = await member.get_participant()
+            effects = list(await participant.hanging_effects()) + list(await participant.aura_effects())
+        except Exception as e:
+            _dbg(f"[REQ-DBG] stacks: hanging effects unreadable ({type(e).__name__}: {e})")
+            return ids
+        for effect in effects:
+            try:
+                ids.add((await effect.spell_template_id(), await effect.enchantment_spell_template_id()))
+            except Exception as e:
+                _dbg(f"[REQ-DBG] stacks: a hanging effect unreadable ({type(e).__name__}: {e})")
+        return ids
+
+    #: The kinds of effect that hang and whose copies don't add up: blades,
+    #: weaknesses, shields, traps and auras. A drawback such as the trap a Feint
+    #: leaves on its caster is none of these, so it is never what decides.
+    _STACKING_KINDS = (
+        SpellType.type_blade, SpellType.type_charm, SpellType.type_ward,
+        SpellType.type_trap, SpellType.type_aura,
+    )
+
+    async def would_stack(self, card: CombatCard, target, enchant=None) -> bool:
+        """Whether casting `card` at `target` adds to what already hangs there.
+
+        Two effects with the same spell template id and the same enchant template id
+        don't stack, whoever cast them; the same spell with another enchant, or none,
+        does. `enchant` is the card the move's own `[...]` would fuse in, which counts
+        when the card can still take it. A card stacks when any of its buffs, traps,
+        charms, wards or auras would land on some member that lacks it, so a mass trap
+        stacks while one living enemy is without it. A card that leaves none of those
+        has nothing to duplicate, and passes.
+        """
+        try:
+            spell_id = await card.template_id()
+            enchant_id = await (await card.get_graphical_spell()).enchantment()
+            if enchant is not None and not isinstance(enchant, str) and await is_enchantable(card):
+                enchant_id = await enchant.template_id()
+            effects = await get_inner_card_effects(card)
+        except Exception as e:
+            _dbg(f"[REQ-DBG] stacks: card unreadable, passing it ({type(e).__name__}: {e})")
+            return True
+
+        empty = TemplateSpell([])
+        held: Dict[int, Set[Tuple[int, int]]] = {}
+        saw_any = False
+        for effect in effects:
+            kinds = [await is_req_satisfied(effect, kind, empty) for kind in self._STACKING_KINDS]
+            if ReqSatisfaction.true not in kinds:
+                continue
+            saw_any = True
+            members = await self._landing_members(await effect.effect_target(), target)
+            if not members:
+                return True
+            for member in members:
+                if id(member) not in held:
+                    held[id(member)] = await self._hanging_ids(member)
+                if (spell_id, enchant_id) not in held[id(member)]:
+                    return True
+        return not saw_any
+
     async def try_execute_config(self, move_config: MoveConfig, willcasted: bool = False) -> bool | Tuple[bool, bool]:
         _dbg(f"[COND-DBG] try_execute_config: condition={move_config.condition}, move={move_config.move}")
         if move_config.condition is not None:
@@ -2002,7 +2089,8 @@ class SprintyCombat(CombatHandler):
             [r for r in move_config.move.card.requirements if isinstance(r, SwapSpec)]
             if is_template else []
         )
-        needs_post_filter = needs_req_met or bool(gambit_clear_specs) or bool(swap_specs)
+        needs_stacks = is_template and SpellType.type_stacks in move_config.move.card.requirements
+        needs_post_filter = needs_req_met or needs_stacks or bool(gambit_clear_specs) or bool(swap_specs)
 
         target = await self.try_get_config_target(move_config.target)
 
@@ -2082,6 +2170,8 @@ class SprintyCombat(CombatHandler):
                     _dbg(f"[MT-DBG] target_selection rejected: ttype={ttype}, card={await cand.name()}")
                     continue
             if needs_req_met and not await self.card_requirements_met(cand, req_member):
+                continue
+            if needs_stacks and not await self.would_stack(cand, target, enchant_card):
                 continue
             # All declared gambit/clear specs must hold simultaneously.
             failed_spec = False

@@ -161,9 +161,17 @@ effect list at runtime. No `max_` counterpart (don't use with `%`).
 | `over_time`           | All over-time effects (DOTs and HOTs)                 |
 | `beneficial_over_time`| Heals over time only                                  |
 | `harmful_over_time`   | Damage over time only                                 |
+| `auras`               | 1 while any aura is up, else 0                        |
+| `beneficial_auras`    | 1 while a positive aura is up (Amplify, Fortify)      |
+| `harmful_auras`       | 1 while a negative aura is up                         |
 
 Disposition matching follows the game's logic: an effect with disposition
 `both` matches either `beneficial` or `harmful` queries.
+
+An aura counts once however many effects it carries, since a side holds one
+aura at a time: `?(self.beneficial_auras == 0) any<aura> @ self` casts an aura
+only while none is up. Each name also takes a singular form (`charm`, `ward`,
+`ot`, `aura`, with or without the prefix).
 
 ## Operators
 
@@ -246,6 +254,41 @@ fails and falls through to the next `|` alternative.
 ```
 
 Cards that have no `ConditionalSpellEffect` always pass the `req_met` check.
+
+## Spell type: `stacks`
+
+Two buffs with the same spell and the same enchant don't stack, whoever cast
+them: a second plain Stormblade on a wizard already holding one adds nothing to
+the next hit. The same spell with a different enchant, or none, does stack, and
+so do two copies enchanted by different cards (a trained Sharpened Blade and the
+item-card one). `stacks` keeps only the cards that would add to what is already
+there:
+
+```
+any<blade & stacks>[sharp] @ ally(last)
+```
+
+A card passes when some effect it would leave is not already hanging on where
+that effect lands, with the same spell template id and the same enchant
+template id. Like `req_met`, it is checked after selection, so a card that
+fails is skipped for the next match, and a line with no card that passes falls
+through to the next `|` alternative.
+
+- **The enchant counts.** The move's own `[...]` enchant is part of the card
+  when the card can still take one, so `any<blade & stacks>[sharp]` passes a
+  plain Stormblade onto a wizard holding a plain one. An already enchanted card
+  counts with the enchant it carries.
+- **Where it lands.** A blade, weakness, shield or trap lands on the move's
+  target, and an aura on the caster. A mass card lands on every living member of
+  its side, and stacks while at least one of them lacks it.
+- **What counts.** Blades, weaknesses, shields, traps and auras. A drawback,
+  such as the trap Feint leaves on its own caster, does not decide anything. A
+  card that leaves none of these (a hit, a heal, a global) has nothing to
+  duplicate, and always passes.
+- **What can't be read** counts as no match: a hanging effect whose ids can't be
+  read never holds a card back, and neither does a card whose own ids can't be.
+
+`stacks` can't be negated: `!stacks` is a parse error, as `!req_met` is.
 
 ## Examples
 
