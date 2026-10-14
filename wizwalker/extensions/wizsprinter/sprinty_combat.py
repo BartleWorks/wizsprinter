@@ -2389,6 +2389,10 @@ class SprintyCombat(CombatHandler):
                             return False
                         enchant_card = None
                 if enchant_card is not None:
+                    # Read before the fuse: it destroys the picked card's window, so its
+                    # handle can't be read, or cast, afterwards.
+                    picked_id = await cur_card.template_id()
+                    enchant_id = await enchant_card.template_id()
                     previous_cards = await self.get_cards()
                     previous_card_names = Counter([await card.name() for card in previous_cards])
                     # Described now: a card handle reads its slot as it is, so after the fuse
@@ -2409,21 +2413,39 @@ class SprintyCombat(CombatHandler):
                         self.trace("  fused the move's enchant. Hand before: %s", hand_before)
                         self.trace("  hand after: %s", await self.describe_hand(new_cards))
                         self.trace("  names new to the hand: %s", diff or "none")
-                    if diff:
-                        cur_card = await self.try_get_spell(NamedSpell(name=diff[0], is_literal=True), only_enchantable=only_enchantable)
-                        if move_config.move.second_enchant:
-                            second_enchant_card = await self.try_get_spell(move_config.move.second_enchant, only_enchants=False)
-                            if second_enchant_card != "none":
-                                if second_enchant_card is not None:
-                                    if await self._fuse_enchant(second_enchant_card, cur_card, recast=True):
-                                        self.cur_card_count -= 1
-                                    elif not enchant_is_optional(move_config.move.second_enchant):
+                    # The fused card keeps its spell's name and template, and carries the
+                    # enchant's template id as its enchantment, so that pair finds it. The
+                    # names are the fallback, for a fuse that does rename.
+                    found = await self._find_fused(new_cards, picked_id, enchant_id)
+                    how = "found by its template and enchant"
+                    if found is None and diff:
+                        found = await self.try_get_spell(NamedSpell(name=diff[0], is_literal=True), only_enchantable=only_enchantable)
+                        how = f"found by its new name {diff[0]!r}"
+                    if found is None:
+                        self.trace("  the fused card is not in the hand")
+                        return False
+                    cur_card = found
+                    fused = how
+                    if move_config.move.second_enchant:
+                        second_enchant_card = await self.try_get_spell(move_config.move.second_enchant, only_enchants=False)
+                        if second_enchant_card != "none":
+                            if second_enchant_card is not None:
+                                second_id = await second_enchant_card.template_id()
+                                if await self._fuse_enchant(second_enchant_card, cur_card, recast=True):
+                                    self.cur_card_count -= 1
+                                    # Found again, for the same reason: this fuse replaced it too.
+                                    cards = await self.get_cards()
+                                    found = (await self._find_fused(cards, picked_id, second_id)
+                                             or await self._find_fused(cards, picked_id, enchant_id))
+                                    if found is None:
+                                        self.trace("  the card fused twice is not in the hand")
                                         return False
-
-                                elif second_enchant_card is None and not enchant_is_optional(move_config.move.second_enchant):
+                                    cur_card = found
+                                elif not enchant_is_optional(move_config.move.second_enchant):
                                     return False
 
-                        fused = diff[0]
+                            elif second_enchant_card is None and not enchant_is_optional(move_config.move.second_enchant):
+                                return False
 
                 elif enchant_card is None and not enchant_optional:
                     return False
@@ -2433,8 +2455,8 @@ class SprintyCombat(CombatHandler):
 
         to_cast = None
         if fused:
-            to_cast = await self.try_get_spell(NamedSpell(name=fused, is_literal=True))
-            source = f"found by the fused card's new name {fused!r}"
+            to_cast = cur_card
+            source = f"the fused card, {fused}"
         elif needs_post_filter:
             # Use the cur_card we picked above — try_get_spell would return the
             # first template match, which may not be the one that passed our filters.
@@ -2499,11 +2521,10 @@ class SprintyCombat(CombatHandler):
                                    await self.slot_of(to_cast), await self.describe_target(target))
                     await to_cast.cast(target, sleep_time=self.config.cast_time*2)
                     await asyncio.sleep(self.config.cast_time) # give it some time for card list to update
-                    if fused:
-                        to_cast = await self.try_get_spell(NamedSpell(name=fused, is_literal=True))
-                    elif needs_post_filter:
-                        # Don't loop another cast — the next template match may not
-                        # satisfy our filters, and we've consumed the one that did.
+                    if fused or needs_post_filter:
+                        # One cast. A fused card's name is its spell's, so looking it up
+                        # again would find a bare copy; and the next template match may
+                        # not satisfy the filters the one cast did.
                         to_cast = None
                     else:
                         to_cast = await self.try_get_spell(move_config.move.card, only_enchants=aims_at_spell)
@@ -2512,6 +2533,24 @@ class SprintyCombat(CombatHandler):
         except wizwalker.errors.WizWalkerMemoryError or ValueError:
             pass # Let it happen if it happens
         return True
+
+    @staticmethod
+    async def _find_fused(cards: List[CombatCard], template_id: int, enchant_id: int) -> Optional[CombatCard]:
+        """The card in `cards` of spell `template_id` carrying enchant `enchant_id`.
+
+        A fuse replaces the card it lands on: the old window goes, and the fused card,
+        same name and template, takes a new one. So the handle picked before a fuse is
+        dead after it, and this is how the card is found again. Two such cards are the
+        same card to cast, so the first is as good as any.
+        """
+        for card in cards:
+            try:
+                if (await card.template_id() == template_id
+                        and await (await card.get_graphical_spell()).enchantment() == enchant_id):
+                    return card
+            except Exception:
+                continue
+        return None
 
     async def _fuse_enchant(self, enchant_card: CombatCard, onto: CombatCard, *, recast: bool) -> bool:
         """Cast an enchant onto a card in hand and wait for the two to fuse.
