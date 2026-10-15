@@ -1,3 +1,4 @@
+import difflib
 from enum import Enum, auto
 from typing import *
 
@@ -203,6 +204,84 @@ def hanging_type_aliases() -> Dict[str, "HangingType"]:
             out[f"beneficial_{n}"] = HangingType[f"beneficial_{canonical}"]
             out[f"harmful_{n}"] = HangingType[f"harmful_{canonical}"]
     return out
+
+
+# What `?(member.<attr> ...)` reads by calling the CombatMember method of that name,
+# mapped to the method a `%` divides by, or None for one that takes no `%`.
+# CONDITIONS.md documents exactly these; the parser refuses any other name.
+MEMBER_ATTRIBUTES: Dict[str, Optional[str]] = {
+    "health": "max_health",
+    "max_health": None,
+    "mana": "max_mana",
+    "max_mana": None,
+    "normal_pips": None,
+    "power_pips": None,
+    "shadow_pips": None,
+    "level": None,
+    "is_boss": None,
+    "is_dead": None,
+    "is_stunned": None,
+    "is_player": None,
+    "is_monster": None,
+    "is_minion": None,
+}
+
+# What `?(deck.<attr> ...)` reads. None takes a `%`.
+DECK_ATTRIBUTES = ("remaining",)
+
+
+def hanging_attributes() -> Dict[str, Tuple[str, Optional[HangingDisposition]]]:
+    """Return {condition attribute: (category, disposition or None)} for the hanging
+    effect counts: each category and alias, bare and with a disposition prefix
+    (`charms`, `beneficial_charm`, `harmful_ot`, ...). None of them takes a `%`."""
+    out: Dict[str, Tuple[str, Optional[HangingDisposition]]] = {}
+    for canonical, (_, _, _, aliases, _) in HANGING_CATEGORIES.items():
+        for name in [canonical] + list(aliases):
+            out[name] = (canonical, None)
+            out[f"beneficial_{name}"] = (canonical, HangingDisposition.beneficial)
+            out[f"harmful_{name}"] = (canonical, HangingDisposition.harmful)
+    return out
+
+
+def _member_attribute_names() -> List[str]:
+    # The documented names, without the hanging aliases, so an error message stays readable.
+    hanging = [f"{side}{canonical}" for canonical in HANGING_CATEGORIES for side in ("", "beneficial_", "harmful_")]
+    return list(MEMBER_ATTRIBUTES) + hanging
+
+
+def condition_attribute_error(attribute: str) -> Optional[str]:
+    """Why `attribute` names nothing a condition can read on any subject, or None.
+
+    A misspelled attribute used to parse and read false on every turn, which looks
+    exactly like a condition that doesn't hold.
+    """
+    if attribute in MEMBER_ATTRIBUTES or attribute in hanging_attributes() or attribute in DECK_ATTRIBUTES:
+        return None
+    valid = _member_attribute_names()
+    close = difflib.get_close_matches(attribute, valid + list(DECK_ATTRIBUTES), n=1)
+    if close:
+        return f"Unknown condition attribute '{attribute}'. Did you mean '{close[0]}'?"
+    return f"Unknown condition attribute '{attribute}'. Valid: {', '.join(valid)}; and deck.remaining."
+
+
+def condition_clause_error(target_type: TargetType, attribute: str, is_percent: bool) -> Optional[str]:
+    """Why `<target>.<attribute>` with or without `%` always reads false, or None.
+
+    `attribute` is one condition_attribute_error accepts; this checks it against its
+    subject, and a `%` against the attribute.
+    """
+    if target_type is TargetType.type_deck:
+        if attribute not in DECK_ATTRIBUTES:
+            return f"deck has one attribute, remaining, so deck.{attribute} reads nothing."
+        if is_percent:
+            return "deck.remaining takes no %: a count of cards has no maximum."
+        return None
+    if attribute not in MEMBER_ATTRIBUTES and attribute not in hanging_attributes():
+        return f"'{attribute}' is read on deck only, not on a combatant."
+    if is_percent and MEMBER_ATTRIBUTES.get(attribute) is None:
+        takes = [name for name, max_name in MEMBER_ATTRIBUTES.items() if max_name]
+        return f"'{attribute}' takes no %: it has no maximum. Only {' and '.join(takes)} do."
+    return None
 
 
 class GambitSpec:

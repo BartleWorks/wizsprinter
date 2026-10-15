@@ -118,13 +118,17 @@ refill ran out, and the main pile is empty: `0`.
   runs short; from that round on it reads `0`.
 - The label is read by its numbers alone, so any client language works.
 
-`deck.remaining` takes no `%`, and `deck.<anything else>` is false.
+`deck.remaining` takes no `%`, and `deck` has no other attribute: either one is a
+parse error.
 
 ## Attributes
 
 ### Member attributes
 
-Any async no-argument method on `CombatMember` can be used as an attribute.
+A condition reads the `CombatMember` method of the same name. These are the only
+names it accepts: any other, such as `boss.hp`, is a parse error that names it, since
+it would otherwise read false on every turn and look like a condition that doesn't
+hold. The table is `MEMBER_ATTRIBUTES` in `combat_api.py`.
 
 | Attribute       | Type  | Has `max_`? | Notes                         |
 |-----------------|-------|-------------|-------------------------------|
@@ -189,7 +193,8 @@ only while none is up. Each name also takes a singular form (`charm`, `ward`,
 - **Hard number**: `2000`, `0`, `3.5`
 - **Percentage**: `50%` -- computes `(current / max) * 100` using the
   corresponding `max_` attribute (e.g. `health` uses `max_health`).
-  Only works for attributes that have a `max_` counterpart (see table above).
+  Only `health` and `mana` have one (see table above); a `%` on any other
+  attribute is a parse error.
 
 ## Enchanting ahead: slots that are held
 
@@ -638,15 +643,21 @@ and the enemy has enough traps), the third line fires.
 
 ## Error handling
 
-All condition failures silently skip the priority (return false):
+Three mistakes are refused when the config is parsed, each with a message that
+names it, because at run time they would read false on every turn:
+
+- **An unknown attribute**: `?(boss.hp > 0)`. The message suggests a close name when
+  there is one, and lists the valid ones.
+- **A `%` on an attribute with no `max_` counterpart**: `?(self.power_pips < 50%)`.
+- **A deck attribute other than `remaining`, or `deck.remaining` with a `%`**; and
+  `remaining` read on a combatant.
+
+Everything else that can't be evaluated silently skips the priority (returns false):
 
 - **Member not found**: no boss in fight, not enough allies/enemies for the
   index, solo fight with `ally(0)`, etc. A backward index off the end of the
   team (`ally(-4)` in a two-player fight) is the same non-answer. Solo,
   `ally(last)` is you, because you are the only player on the team.
-- **Attribute missing**: typo in attribute name or method doesn't exist
-- **No `max_` counterpart**: using `%` with an attribute that has no max
-  (e.g. `normal_pips`)
 - **Division by zero**: max value is 0
 - **Hanging effect read failure**: participant not accessible, memory error
 - **`req_met` evaluation failure**: card has no conditional effects (passes),

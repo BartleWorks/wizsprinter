@@ -198,6 +198,9 @@ class TreeToConfig(Transformer):
 
     def cond_clause(self, items):
         target, attr, op, value = items
+        error = condition_clause_error(target.target_type, attr, value[1])
+        if error:
+            raise ValueError(error)
         return Condition(target, attr, op, *value)
 
     def condition(self, items):
@@ -250,7 +253,12 @@ class TreeToConfig(Transformer):
         return AggregationMode.agg_avg
 
     def cond_attr(self, items):
-        return str(items[0])
+        # A name the condition can't read would be false on every turn, silently.
+        attr = str(items[0])
+        error = condition_attribute_error(attr)
+        if error:
+            raise ValueError(error)
+        return attr
 
     def cond_op(self, items):
         return ComparisonOp(str(items[0]))

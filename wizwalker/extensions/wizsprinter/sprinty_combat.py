@@ -15,7 +15,7 @@ from wizwalker.memory.memory_objects.conditionals import charm_effect_types, war
 from .combat_backends.combat_config_parser import TargetType, TargetData, MoveConfig, TemplateSpell \
     , NamedSpell, SpellType, Spell, DrawSpell, Condition, AllCondition, ConditionTarget, ComparisonOp, AggregationMode \
     , GambitSpec, ClearSpec, EchoSpec, SwapSpec, NotTypeSpec, ExcludeNameSpec, HangingType, HANGING_CATEGORIES \
-    , hanging_type_info, POST_FILTER_TYPES
+    , hanging_type_info, POST_FILTER_TYPES, MEMBER_ATTRIBUTES, DECK_ATTRIBUTES, hanging_attributes
 from wizwalker.memory.memory_objects.conditionals import ReqHangingAura
 from .combat_backends.backend_base import BaseCombatBackend
 from .combat_backends.spell_ranking import (
@@ -1371,18 +1371,10 @@ class SprintyCombat(CombatHandler):
             return [await self.get_client_member()] + await self.get_allies()
         return None
 
-    # Map predicate-attribute aliases to (category, disposition) pairs. Built
-    # from HANGING_CATEGORIES so adding a category there auto-extends predicates.
-    # Each category emits 3 entries: <canonical>, beneficial_<canonical>,
-    # harmful_<canonical>, plus the same triplet for every alias (e.g. "charm",
-    # "ward", "ot", "aura"). e.g. charms → "charms", "beneficial_charms",
-    # "harmful_charms", "charm", "beneficial_charm", "harmful_charm".
-    _HANGING_ATTRS = {}
-    for _canon, (_, _, _, _aliases, _) in HANGING_CATEGORIES.items():
-        for _name in [_canon] + list(_aliases):
-            _HANGING_ATTRS[_name] = (_canon, None)
-            _HANGING_ATTRS[f"beneficial_{_name}"] = (_canon, HangingDisposition.beneficial)
-            _HANGING_ATTRS[f"harmful_{_name}"] = (_canon, HangingDisposition.harmful)
+    # Predicate-attribute aliases mapped to (category, disposition) pairs. Built
+    # from HANGING_CATEGORIES so adding a category there auto-extends predicates,
+    # and shared with the parser, which refuses any name not in it or MEMBER_ATTRIBUTES.
+    _HANGING_ATTRS = hanging_attributes()
 
     _HANGING_CATEGORY_MAP = {k: v[0] for k, v in HANGING_CATEGORIES.items()}
 
@@ -1434,22 +1426,23 @@ class SprintyCombat(CombatHandler):
             category, disposition = self._HANGING_ATTRS[condition.attribute]
             return float(await self._count_hanging_effects(member, category, disposition))
 
-        attr_fn = getattr(member, condition.attribute, None)
-        if attr_fn is None or not callable(attr_fn):
+        # The parser refuses any other name, but a Condition built in code isn't parsed.
+        if condition.attribute not in MEMBER_ATTRIBUTES:
             return None
-        actual = await attr_fn()
+        actual = await getattr(member, condition.attribute)()
         if condition.is_percent:
-            max_fn = getattr(member, f"max_{condition.attribute}", None)
-            if max_fn is None or not callable(max_fn):
+            max_name = MEMBER_ATTRIBUTES[condition.attribute]
+            if max_name is None:
                 return None
+            max_fn = getattr(member, max_name)
             max_val = await max_fn()
             if max_val == 0:
                 return None
             actual = (actual / max_val) * 100
         return float(actual)
 
-    #: What `deck.<attr>` can read. Unknown names are false, as for a member.
-    _DECK_ATTRS = ("remaining",)
+    #: What `deck.<attr>` can read. The parser refuses any other name.
+    _DECK_ATTRS = DECK_ATTRIBUTES
 
     async def _evaluate_deck_condition(self, condition: Condition) -> bool:
         """`?(deck.remaining >= 2)`. A percentage has nothing to be a share of."""
