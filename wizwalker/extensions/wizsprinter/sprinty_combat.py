@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 #: What a turn decided and why, at DEBUG: the hand each round began with, every
 #: priority walked and why it was passed over, every fuse with the hand on either
 #: side of it, which card was then cast and at whom. Off unless the application
-#: enables this logger. A combatant is named by its seat, never its name, since
+#: enables this logger. A combatant is named by its slot, never its name, since
 #: a player's is a wizard's name.
 turn_logger = logging.getLogger("wizwalker.extensions.wizsprinter.turns")
 
@@ -885,7 +885,7 @@ class SprintyCombat(CombatHandler):
         return None
 
     async def describe_target(self, target) -> str:
-        """Who or what a move is cast at, by seat: `self`, `team seat 2`, `enemy seat 1 (boss)`."""
+        """Who or what a move is cast at, by slot: `self`, `team slot 2`, `enemy slot 1 (boss)`."""
         if target is None:
             return "no target"
         if isinstance(target, list):
@@ -906,10 +906,10 @@ class SprintyCombat(CombatHandler):
                 return "self"
             for i, m in enumerate(await self.get_team(), 1):
                 if await owner_of(m) == owner:
-                    return f"team seat {i}"
+                    return f"team slot {i}"
             for i, m in enumerate(await self.get_enemies(), 1):
                 if await owner_of(m) == owner:
-                    return f"enemy seat {i}" + (" (boss)" if await m.is_boss() else "")
+                    return f"enemy slot {i}" + (" (boss)" if await m.is_boss() else "")
         except Exception:
             pass
         return "<unreadable combatant>"
