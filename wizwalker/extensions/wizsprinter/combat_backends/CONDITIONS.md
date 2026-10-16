@@ -3,6 +3,8 @@
 Conditions let you gate combat priorities on runtime state. They are optional
 and purely additive -- existing configs work unchanged.
 
+The rest of the config language -- lines, moves, targets -- is in `DSL.md`.
+
 ## Syntax
 
 ```
