@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import *
 
 from lark import Lark
@@ -5,6 +6,17 @@ from lark import Lark
 from .backend_base import BaseCombatBackend
 from .combat_config_parser import CombatConfig, PriorityLine, get_sprinty_grammar, TreeToConfig, Move, MoveConfig
 from ..sprinty_combat import SprintyCombat
+
+
+@lru_cache(maxsize=1)
+def _parser() -> Lark:
+    """The combat config parser, built once.
+
+    Building it compiles the grammar, about 77 ms, and a provider is made for every
+    fight. One instance is safe to share: lark's Earley parser fixes its state when it
+    is built and keeps each parse's in locals.
+    """
+    return Lark(get_sprinty_grammar())
 
 
 class CombatConfigProvider(BaseCombatBackend):
@@ -15,10 +27,7 @@ class CombatConfigProvider(BaseCombatBackend):
             self.config: CombatConfig = self.parse_config(file.read())
 
     def parse_config(self, file_contents) -> CombatConfig:
-        grammar = get_sprinty_grammar()
-
-        parser = Lark(grammar)
-        tree = parser.parse(file_contents)
+        tree = _parser().parse(file_contents)
         return self._expand_config(TreeToConfig().transform(tree))
 
     async def get_real_round(self, r: int) -> Optional[PriorityLine]:

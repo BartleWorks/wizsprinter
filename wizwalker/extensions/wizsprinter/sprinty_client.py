@@ -196,7 +196,7 @@ class SprintyClient(Client):
         return await self.goto_closest_of(await self.get_mana_wisps(excluded_ids), only_safe)
 
     async def goto_closest_mob(self, only_safe: bool = False, excluded_ids: Set[int] = None) -> bool:
-        return await self.goto_closest_of(await self.get_mob(excluded_ids), only_safe)
+        return await self.goto_closest_of(await self.get_mobs(excluded_ids), only_safe)
 
     async def calc_health_ratio(self) -> float:
         """Simply returns current health divided by max health"""
