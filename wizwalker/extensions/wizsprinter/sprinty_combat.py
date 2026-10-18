@@ -216,6 +216,11 @@ aoe_targets = {
 #: hangs the fight.
 ENCHANT_TIMEOUT = 5.0
 
+#: How long a draw or a discard may take to show in the hand. A dropped click, or
+#: the planning timer running out first, changes nothing there, and the waits for
+#: the hand to change had no limit, so either hung the round.
+HAND_CHANGE_TIMEOUT = 5.0
+
 
 class _Restart:
     """Returned by `try_execute_config` when held enchants must run before the
@@ -805,6 +810,13 @@ class SprintyCombat(CombatHandler):
         self.max_hand_size: Optional[int] = None
         # Enchant-only slots reached this walk, waiting for the round's cast.
         self.held_enchants: List[MoveConfig] = []
+        # The hand's window, found once a fight (see get_num_card_windows).
+        self._hand_window = None
+        # The combatants and which of them is this client, read once a round while
+        # handle_round runs (see get_members).
+        self._caching_members = False
+        self._members_cache: Optional[List[CombatMember]] = None
+        self._client_member_cache: Optional[CombatMember] = None
 
     async def handle_combat(self):
         self.turn_adjust = 0
@@ -817,6 +829,8 @@ class SprintyCombat(CombatHandler):
         self.max_hand_size = None
         self.held_enchants = []
         self._did_deck_inspect = False  # one-shot deck dump per fight
+        self._hand_window = None
+        self._forget_members()
         await super().handle_combat()
 
     # --- The turn trace ----------------------------------------------------
@@ -914,6 +928,39 @@ class SprintyCombat(CombatHandler):
             pass
         return "<unreadable combatant>"
 
+    # --- The combatants, read once a round ------------------------------------
+    # Each lookup used to search the whole UI for the combatant windows, and
+    # get_allies, get_enemies and get_team did it twice, through
+    # get_client_member. They cannot change during the planning phase, so within
+    # handle_round the first read serves the rest. A lookup that misses forgets
+    # them, so its retries still see a member who has only just appeared.
+
+    def _forget_members(self) -> None:
+        self._members_cache = None
+        self._client_member_cache = None
+
+    async def get_members(self) -> List[CombatMember]:
+        if self._members_cache is not None:
+            return self._members_cache
+        members = await super().get_members()
+        if self._caching_members and members:
+            self._members_cache = members
+        return members
+
+    async def get_client_member(self, *, retries: int = 5, sleep_time: float = 0.5) -> CombatMember:
+        if self._client_member_cache is not None:
+            return self._client_member_cache
+        for _ in range(retries):
+            for member in await self.get_members():
+                if await member.is_client():
+                    if self._caching_members:
+                        self._client_member_cache = member
+                    return member
+            self._forget_members()
+            await asyncio.sleep(sleep_time)
+
+        raise ValueError("Couldn't find client's CombatMember")
+
     async def get_member_named(self, name: str) -> Optional[CombatMember]:
         # Issue: #4
         async def _inner():
@@ -922,6 +969,7 @@ class SprintyCombat(CombatHandler):
             for member in members:
                 if name == await member.name() and await self._is_targetable(member):
                     return member
+            self._forget_members()
             return None
         try:
             return await wizwalker.utils.maybe_wait_for_any_value_with_timeout(
@@ -939,6 +987,7 @@ class SprintyCombat(CombatHandler):
             for member in members:
                 if name.lower() in (await member.name()).lower() and await self._is_targetable(member):
                     return member
+            self._forget_members()
             return None
         try:
             return await wizwalker.utils.maybe_wait_for_any_value_with_timeout(
@@ -968,14 +1017,35 @@ class SprintyCombat(CombatHandler):
             return []
 
     async def get_num_card_windows(self) -> int:
-        hand = (await self.client.root_window.get_windows_with_name("Hand"))[0]
-        num = 0
-        for i in range(7):
-            card = await hand.get_child_by_name(f"Card{i+1}")
-            if await card.is_visible():
-                num += 1
+        # Found once a fight, as the card windows are (`_get_card_windows`): the
+        # search walks the whole UI, and the draw and discard waits poll this.
+        if self._hand_window is None:
+            self._hand_window = (await self.client.root_window.get_windows_with_name("Hand"))[0]
+        try:
+            num = 0
+            for i in range(7):
+                card = await self._hand_window.get_child_by_name(f"Card{i+1}")
+                if await card.is_visible():
+                    num += 1
+        except Exception:
+            self._hand_window = None  # look it up again next time
+            raise
 
         return num
+
+    async def _wait_for_card_count_change(self, before: int) -> bool:
+        """Wait until the hand holds other than `before` cards; False after HAND_CHANGE_TIMEOUT."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + HAND_CHANGE_TIMEOUT
+        while True:
+            try:
+                if await self.get_num_card_windows() != before:
+                    return True
+            except (IndexError, ValueError, wizwalker.errors.WizWalkerMemoryError):
+                pass  # the hand is being rebuilt, or the fight is over
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
 
     async def get_card_named(self, name: str) -> Optional[CombatCard]:
         try:
@@ -1273,8 +1343,9 @@ class SprintyCombat(CombatHandler):
     async def disc_on_target(self, targ: CombatCard):
         pre_discard_count = await self.get_num_card_windows()
         await targ.discard()
-        while await self.get_num_card_windows() == pre_discard_count:
-            await asyncio.sleep(0.1)
+        if not await self._wait_for_card_count_change(pre_discard_count):
+            logger.warning("A discard did not leave the hand within %.0f s", HAND_CHANGE_TIMEOUT)
+            return
         self.cur_card_count -= 1
 
     async def try_get_config_target(self, target: TargetData) -> Union[bool, Optional[CombatMember]]:
@@ -2254,8 +2325,9 @@ class SprintyCombat(CombatHandler):
                     if await draw_window.is_control_grayed():
                         break
                     await self.draw_button()
-                    while await self.get_num_card_windows() == card_count:
-                        await asyncio.sleep(0.1)
+                    if not await self._wait_for_card_count_change(card_count):
+                        logger.warning("A draw did not reach the hand within %.0f s", HAND_CHANGE_TIMEOUT)
+                        break
                     self.cur_card_count += 1
                     await asyncio.sleep(self.config.cast_time*2)
 
@@ -2618,7 +2690,8 @@ class SprintyCombat(CombatHandler):
                         to_cast = await self.try_get_spell(move_config.move.card, only_enchants=aims_at_spell)
                 except ValueError:
                     break # Issue: 8
-        except wizwalker.errors.WizWalkerMemoryError or ValueError:
+        # A tuple: `A or B` is just A, so this caught WizWalkerMemoryError alone.
+        except (wizwalker.errors.WizWalkerMemoryError, ValueError):
             pass # Let it happen if it happens
         return True
 
@@ -2746,6 +2819,16 @@ class SprintyCombat(CombatHandler):
         self.turn_adjust -= 1
 
     async def handle_round(self):
+        # The combatants are read once for the round; see get_members.
+        self._forget_members()
+        self._caching_members = True
+        try:
+            await self._play_round()
+        finally:
+            self._caching_members = False
+            self._forget_members()
+
+    async def _play_round(self):
         # try:
         #     await self.client.mouse_handler.activate_mouseless()
         # except wizwalker.errors.HookAlreadyActivated:
