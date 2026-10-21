@@ -20,11 +20,26 @@ def _parser() -> Lark:
 
 
 class CombatConfigProvider(BaseCombatBackend):
-    def __init__(self, path: str, cast_time: float = 0.2):
+    def __init__(self, path: str, cast_time: float = 0.2, *, content: str = None):
+        """
+        Args:
+            path: The config file, or a name for `content` when it is given
+            cast_time: Seconds the casts settle for
+            content: The config itself, read in place of the file
+        """
         super().__init__(cast_time=cast_time)
         self.filename = path
-        with open(path) as file:
-            self.config: CombatConfig = self.parse_config(file.read())
+        if content is None:
+            # UTF-8, not the locale's code page, which on Windows mangled any
+            # name outside ASCII
+            with open(path, encoding="utf-8") as file:
+                content = file.read()
+        self.config: CombatConfig = self.parse_config(content)
+
+    @classmethod
+    def from_string(cls, content: str, cast_time: float = 0.2) -> "CombatConfigProvider":
+        """A provider for a config held as text rather than in a file."""
+        return cls("<inline>", cast_time, content=content)
 
     def parse_config(self, file_contents) -> CombatConfig:
         tree = _parser().parse(file_contents)

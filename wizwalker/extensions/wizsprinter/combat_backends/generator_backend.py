@@ -14,8 +14,9 @@ class CombatConfigGenerator(BaseCombatBackend):
     async def get_heal_priorities(self) -> list[MoveConfig]:
         me = await self.combat.get_client_member()
         client_health = await me.health()
-        client_max_health = await me.max_health() # TODO: Can this be zero?
-        if client_health / client_max_health > 0.4:
+        client_max_health = await me.max_health()
+        # It can be zero, read mid-change, and dividing by it raised
+        if client_max_health <= 0 or client_health / client_max_health > 0.4:
             return []
 
         return [
@@ -69,4 +70,6 @@ class CombatConfigGenerator(BaseCombatBackend):
         return PriorityLine(priorities=priorities)
 
     async def get_relative_round(self, r: int) -> Optional[PriorityLine]:
-        return self.get_real_round(r) # it's all automatic, so they mean the same thing
+        # it's all automatic, so they mean the same thing. Awaited: the caller got
+        # the coroutine itself where a PriorityLine belonged.
+        return await self.get_real_round(r)
