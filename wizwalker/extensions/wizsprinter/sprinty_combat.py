@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 from typing import *
+from typing import NamedTuple
 
 import wizwalker
 from wizwalker.combat import CombatHandler
@@ -297,11 +298,77 @@ def get_req_status(req_statement: bool) -> ReqSatisfaction:
     return ReqSatisfaction.false
 
 
-async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template: TemplateSpell) -> bool:
-    eff_type = await effect.effect_type()
-    target = await effect.effect_target()
-    param = await effect.effect_param()
-    rounds = await effect.num_rounds()
+class EffectFacts(NamedTuple):
+    """What a requirement asks of one effect, read from memory once.
+
+    Every requirement reads the same four fields, so a caller testing several
+    against one effect reads them here first rather than once per requirement.
+    """
+
+    effect_type: SpellEffects
+    target: EffectTarget
+    param: int
+    rounds: int
+
+
+async def read_effect_facts(effect: DynamicSpellEffect) -> EffectFacts:
+    return EffectFacts(
+        await effect.effect_type(),
+        await effect.effect_target(),
+        await effect.effect_param(),
+        await effect.num_rounds(),
+    )
+
+
+class EffectReads:
+    """A card's effects, each read the first time a requirement asks about it.
+
+    `async for` walks them in order, reading as it goes, so a loop that stops at
+    the first match reads no further than it did before; a second loop over the
+    same effects reads nothing again.
+    """
+
+    def __init__(self, effects: Sequence[DynamicSpellEffect]):
+        self._effects = list(effects)
+        self._facts: List[Optional[EffectFacts]] = [None] * len(self._effects)
+
+    async def at(self, index: int) -> EffectFacts:
+        if self._facts[index] is None:
+            self._facts[index] = await read_effect_facts(self._effects[index])
+        return self._facts[index]
+
+    def __len__(self) -> int:
+        return len(self._effects)
+
+    def __aiter__(self):
+        # A plain iterator, not an async generator: a loop that returns early
+        # leaves a generator for the event loop to finalize, a task each time
+        return _EffectReadsIterator(self)
+
+
+class _EffectReadsIterator:
+    def __init__(self, reads: EffectReads):
+        self._reads = reads
+        self._index = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> EffectFacts:
+        if self._index >= len(self._reads):
+            raise StopAsyncIteration
+        facts = await self._reads.at(self._index)
+        self._index += 1
+        return facts
+
+
+async def is_req_satisfied(effect: DynamicSpellEffect, req: SpellType, template: TemplateSpell) -> ReqSatisfaction:
+    return facts_satisfy(await read_effect_facts(effect), req)
+
+
+def facts_satisfy(facts: EffectFacts, req: SpellType) -> ReqSatisfaction:
+    """Whether an effect, as `read_effect_facts` read it, meets one requirement."""
+    eff_type, target, param, rounds = facts
 
     # Blade, charm, ward and trap match a single-target effect and a team one
     # alike: `any<trap>` includes Mass Feint, and `any<trap & aoe>` is a mass
@@ -487,7 +554,7 @@ def name_matches(written: str, card_name: str, is_literal: bool) -> bool:
     return written.lower() in card_name.lower()
 
 
-async def card_is_excluded(card: CombatCard, effects: List[DynamicSpellEffect], template: TemplateSpell) -> bool:
+async def card_is_excluded(card: CombatCard, facts: EffectReads, template: TemplateSpell) -> bool:
     """Whether a `!type` or `!name` inside any<...> rules the card out."""
     negated_types = [r.type for r in template.requirements if isinstance(r, NotTypeSpec)]
     excluded_names = [r for r in template.requirements if isinstance(r, ExcludeNameSpec)]
@@ -496,14 +563,15 @@ async def card_is_excluded(card: CombatCard, effects: List[DynamicSpellEffect], 
         if any(name_matches(r.name, card_name, r.is_literal) for r in excluded_names):
             return True
     for spell_type in negated_types:
-        for e in effects:
-            if await is_req_satisfied(e, spell_type, template) is ReqSatisfaction.true:
+        async for f in facts:
+            if facts_satisfy(f, spell_type) is ReqSatisfaction.true:
                 return True
     return False
 
 
 async def does_card_contain_reqs(card: CombatCard, template: TemplateSpell) -> bool:
-    effects = await get_inner_card_effects(card)
+    # Each effect read once, not once per requirement asked of it
+    facts = EffectReads(await get_inner_card_effects(card))
     is_aoe_req = SpellType.type_aoe in template.requirements
     # req_met / stacks / stronger / gambit() / clear() / echo() / swap() are
     # meta-filters checked post-selection, not per-effect. The negations are
@@ -513,21 +581,20 @@ async def does_card_contain_reqs(card: CombatCard, template: TemplateSpell) -> b
         if r not in POST_FILTER_TYPES
         and not isinstance(r, (GambitSpec, ClearSpec, EchoSpec, SwapSpec, NotTypeSpec, ExcludeNameSpec))
     ]
-    if await card_is_excluded(card, effects, template):
+    if await card_is_excluded(card, facts, template):
         return False
     matched_reqs = 0
     needed_matches = len(reqs_to_check)
 
-    if SpellType.type_damage in template.requirements:
+    # Only when tracing: it read the card's name for every damage template matched
+    if _DEBUG and SpellType.type_damage in template.requirements:
         card_name = await card.name()
-        eff_info = []
-        for e in effects:
-            eff_info.append(f"{await e.effect_type()}@{await e.effect_target()}")
+        eff_info = [f"{f.effect_type}@{f.target}" async for f in facts]
         _dbg(f"[MT-DBG] does_card_contain_reqs: card={card_name}, reqs={template.requirements}, effects=[{', '.join(eff_info)}]")
 
     for req in reqs_to_check:
-        for e in effects:
-            req_status = await is_req_satisfied(e, req, template)
+        async for f in facts:
+            req_status = facts_satisfy(f, req)
             match req_status:
                 case ReqSatisfaction.true:
                     matched_reqs += 1
@@ -543,8 +610,8 @@ async def does_card_contain_reqs(card: CombatCard, template: TemplateSpell) -> b
     # Multi-target spells use an effect type not in wizwalker's enum (shows as
     # invalid_spell_effect). Infer spell category from the multi-target effect target.
     if matched_reqs < needed_matches:
-        for e in effects:
-            eff_target = await e.effect_target()
+        async for f in facts:
+            eff_target = f.target
             if eff_target == EffectTarget.multi_target_enemy and SpellType.type_damage in template.requirements:
                 matched_reqs += 1
                 break
@@ -556,10 +623,8 @@ async def does_card_contain_reqs(card: CombatCard, template: TemplateSpell) -> b
         # Reject cards that have single-target damage effects — they require
         # target selection and are not true AOEs (e.g. Storm Beetle: single-target
         # damage + team blade falsely matches type_aoe via the blade's target).
-        for e in effects:
-            eff_type = await e.effect_type()
-            target = await e.effect_target()
-            if eff_type in damage_effects and target in enemy_targets and target not in aoe_targets:
+        async for f in facts:
+            if f.effect_type in damage_effects and f.target in enemy_targets and f.target not in aoe_targets:
                 return False
 
     return matched_reqs == needed_matches
@@ -669,14 +734,15 @@ async def _score_node(
     # Leaf. The filter is `is_req_satisfied` itself rather than a copy of its
     # conditions, so ranking scores exactly what matching matched — including
     # the sign convention that makes a ward's param negative.
-    if await is_req_satisfied(effect, ranker.score_type, template) is not ReqSatisfaction.true:
+    # The fields read once, for the requirement and the checks after it
+    facts = await read_effect_facts(effect)
+    if facts_satisfy(facts, ranker.score_type) is not ReqSatisfaction.true:
         return lands_together()
 
-    eff_type = await effect.effect_type()
-    if (eff_type in flat_buff_effects) is not flat:
+    if (facts.effect_type in flat_buff_effects) is not flat:
         return lands_together()
 
-    if ranker.aoe_only and await effect.effect_target() not in aoe_targets:
+    if ranker.aoe_only and facts.target not in aoe_targets:
         return lands_together()
 
     # `effect_param` is used exactly as the game stores it, sign included: on a
@@ -684,7 +750,7 @@ async def _score_node(
     # includes any enchantment on the card, so neither needs correcting for.
     # The sign matters because <inc_damage> and its four siblings match both a
     # trap on the enemy and a shield on us — see `buff_sort_key`.
-    return Amount(await effect.effect_param())
+    return Amount(facts.param)
 
 
 async def card_facts(
@@ -2203,15 +2269,15 @@ class SprintyCombat(CombatHandler):
             _dbg(f"[REQ-DBG] stacks: card unreadable, passing it ({type(e).__name__}: {e})")
             return True
 
-        empty = TemplateSpell([])
         held: Dict[int, Set[Tuple[int, int]]] = {}
         saw_any = False
         for effect in effects:
-            kinds = [await is_req_satisfied(effect, kind, empty) for kind in self._STACKING_KINDS]
-            if ReqSatisfaction.true not in kinds:
+            # Read once for all six kinds, and the landing: it was read seven times
+            facts = await read_effect_facts(effect)
+            if not any(facts_satisfy(facts, kind) is ReqSatisfaction.true for kind in self._STACKING_KINDS):
                 continue
             saw_any = True
-            members = await self._landing_members(await effect.effect_target(), target)
+            members = await self._landing_members(facts.target, target)
             if not members:
                 return True
             for member in members:
@@ -2265,19 +2331,21 @@ class SprintyCombat(CombatHandler):
         card that leaves no aura, an aura that can't be read and a landing that can't
         be told all pass, as `stacks` lets through what it can't see.
         """
-        empty = TemplateSpell([])
         try:
             effects = await get_inner_card_effects(card)
             auras = []
+            aura_target = None
             for effect in effects:
-                kinds = [await is_req_satisfied(effect, kind, empty)
-                         for kind in (SpellType.type_aura, SpellType.type_harmful_aura)]
-                if ReqSatisfaction.true in kinds:
+                facts = await read_effect_facts(effect)
+                if any(facts_satisfy(facts, kind) is ReqSatisfaction.true
+                       for kind in (SpellType.type_aura, SpellType.type_harmful_aura)):
                     auras.append(effect)
+                    if aura_target is None:
+                        aura_target = facts.target
             if not auras:
                 return True
-            on_enemy = await auras[0].effect_target() in enemy_targets
-            members = await self._landing_members(await auras[0].effect_target(), target)
+            on_enemy = aura_target in enemy_targets
+            members = await self._landing_members(aura_target, target)
             ours = -1 if on_enemy else 1
             card_value = ours * await self._aura_value(auras)
         except Exception as e:
@@ -2459,7 +2527,8 @@ class SprintyCombat(CombatHandler):
             # Card has single-target damage — only compatible with enemy/boss targeting
             if await card_requires_target_selection(cand):
                 if ttype in (TargetType.type_aoe, TargetType.type_self, TargetType.type_ally):
-                    _dbg(f"[MT-DBG] target_selection rejected: ttype={ttype}, card={await cand.name()}")
+                    if _DEBUG:
+                        _dbg(f"[MT-DBG] target_selection rejected: ttype={ttype}, card={await cand.name()}")
                     if self.tracing:
                         self.trace("  skip %s: it needs a target picked, and the move is @ %s",
                                    await self.describe_card(cand), ttype)
@@ -2512,7 +2581,8 @@ class SprintyCombat(CombatHandler):
         # an attack keeps its hand as it is and takes its own `[...]` enchant.
         if self.held_enchants and not aims_at_spell:
             if await card_is_attack(cur_card):
-                _dbg(f"[HOLD-DBG] {await cur_card.name()} attacks; held enchants dropped")
+                if _DEBUG:
+                    _dbg(f"[HOLD-DBG] {await cur_card.name()} attacks; held enchants dropped")
                 self.trace("  it attacks: %d held enchant slot(s) dropped", len(self.held_enchants))
                 self.held_enchants = []
             else:
@@ -2523,7 +2593,10 @@ class SprintyCombat(CombatHandler):
         # Multi-target spell — wrap single target in list for confirm button flow.
         # Use "enemies" / "allies" targets to select all, or select(...) for specific targets.
         is_mt = await card_is_multi_target(cur_card)
-        _dbg(f"[MT-DBG] card={await cur_card.name()}, is_multi_target={is_mt}, target={target}, target_type={type(target).__name__}")
+        # Guarded, as the other traces that read memory are: an f-string's awaits
+        # run whether or not _dbg prints it
+        if _DEBUG:
+            _dbg(f"[MT-DBG] card={await cur_card.name()}, is_multi_target={is_mt}, target={target}, target_type={type(target).__name__}")
         if is_mt:
             if target is None:
                 _dbg(f"[MT-DBG] multi-target but target is None")
@@ -2837,9 +2910,11 @@ class SprintyCombat(CombatHandler):
             self.config.attach_combat(self) # For safety. Could probably also do this in handle_comba
 
             real_round = await self.round_number()
-            _dbg_castable = await self.get_castable_cards()
-            _dbg_names = [await c.name() for c in _dbg_castable]
-            _dbg(f"[MT-DBG] castable cards: {_dbg_names}")
+            if _DEBUG:
+                # Every card's castable flag and name, each round: only when tracing
+                _dbg_castable = await self.get_castable_cards()
+                _dbg_names = [await c.name() for c in _dbg_castable]
+                _dbg(f"[MT-DBG] castable cards: {_dbg_names}")
             await self._inspect_deck_once()
             # Read before anything is cast: whether the refill filled the hand.
             self.round_start_hand = len(await self.get_cards())
