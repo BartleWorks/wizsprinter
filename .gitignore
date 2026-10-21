@@ -4,3 +4,8 @@ experiments/
 
 # Compiled Python files
 *.pyc
+__pycache__/
+
+# The dev environment and its test cache
+.venv/
+.pytest_cache/

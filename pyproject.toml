@@ -16,3 +16,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["wizwalker"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.0",
+    # Our wizwalker, at the commit BartleBot pins, rather than PyPI's; move it with
+    # that pin. A dependency group, not [tool.uv.sources]: uv reads a git or path
+    # dependency's sources too, and two pins of wizwalker then refuse to lock.
+    "wizwalker @ git+https://github.com/BartleWorks/wizwalker.git@79003692eaf949e0f5053566edbac4d17f0f25e4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
