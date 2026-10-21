@@ -223,6 +223,23 @@ ENCHANT_TIMEOUT = 5.0
 HAND_CHANGE_TIMEOUT = 5.0
 
 
+async def _poll(predicate, timeout: float, interval: float = 0.05) -> bool:
+    """Read `predicate` until it holds or `timeout` passes; whether it held.
+
+    Read at least once, and once more at the deadline. wizwalker.utils.poll_until
+    does this too, but not in every wizwalker this may be pinned beside.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if await predicate():
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(interval, remaining))
+
+
 class _Restart:
     """Returned by `try_execute_config` when held enchants must run before the
     card it picked is cast. The round then walks its priorities again, since an
@@ -2802,10 +2819,18 @@ class SprintyCombat(CombatHandler):
                        await self.describe_card(onto), await self.slot_of(onto), before)
         await enchant_card.cast(onto, sleep_time=self.config.cast_time*2)
         clicks = 1
-        while True:
-            await asyncio.sleep(self.config.cast_time*2 if recast else 0.1)
+        now = before
+
+        async def _fused():
+            nonlocal now
             now = len(await self.get_cards())
-            if now != before:
+            return now != before
+
+        while True:
+            # Each click has until the next would go out, as it did, but the hand
+            # is read throughout. The cast has mostly seen the fuse already, and
+            # a fixed sleep first spent the whole of it regardless.
+            if await _poll(_fused, self.config.cast_time*2 if recast else 0.1):
                 self.trace("  fused after %d click(s): %d cards in hand", clicks, now)
                 return True
             if loop.time() >= deadline:
