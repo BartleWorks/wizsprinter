@@ -573,6 +573,33 @@ async def read_control_checkbox_text(checkbox: Window) -> str:
     return await checkbox.read_wide_string_from_offset(616)
 
 
+#: How long a spiral door page click is given to show its new page.
+SPIRAL_PAGE_TIMEOUT = 1.0
+
+
+async def _spiral_door_page(option_window) -> str | None:
+    """The page the spiral door shows, as its `<center>2/3</center>` reads, or None."""
+    for child in await option_window.children():
+        if await child.name() == 'pageCount':
+            return (await child.maybe_text())[8:-9].split('/', 1)[0]
+    return None
+
+
+async def _turn_spiral_page(p, option_window, button_name: str) -> str | None:
+    """Click a page button and wait for the page number to move; returns the page then.
+
+    The number was read straight after the click, and the click repeated while it
+    read the same, so a page that showed a frame late was clicked past.
+    """
+    before = await _spiral_door_page(option_window)
+    await p.mouse_handler.click_window_with_name(button_name)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SPIRAL_PAGE_TIMEOUT
+    while (now := await _spiral_door_page(option_window)) == before and loop.time() < deadline:
+        await asyncio.sleep(0.05)
+    return now
+
+
 @logger.catch()
 # trace back to the nearest spiral door and teleport to destinationWorld
 async def goToNewWorld(p, destinationWorld):
@@ -606,14 +633,11 @@ async def goToNewWorld(p, destinationWorld):
     # user could be on any of the three pages when opening the world door depending on what their active quest is
     # switch all the way to the first page to standardize it
     # in case wizwalker misclicked / didn't click enough originally when resetting to page 1, ensure we are on page 1 (and if not click over again)
-    while str(currentPage) != '1':
-        await p.mouse_handler.click_window_with_name('leftButton')
-        await asyncio.sleep(0.2)
-        for child in await option_window[0].children():
-            if await child.name() == 'pageCount':
-                pageCount = await child.maybe_text()
-                pageCount = pageCount[8:-9]
-                currentPage = pageCount.split('/', 1)[0]
+    # Bounded: a page that never reads 1 kept this clicking forever
+    for _ in range(30):
+        if str(currentPage) == '1':
+            break
+        currentPage = await _turn_spiral_page(p, option_window[0], 'leftButton')
 
     worldIndex = worldList.index(destinationWorld)
     spiralGateName = zoneDoorNameList[worldIndex]
@@ -638,21 +662,20 @@ async def goToNewWorld(p, destinationWorld):
                     isChildFound = True
                     break
 
+        # Through: the break above left only the loop over this page's options,
+        # and every page after went round again, clicking the world and teleport
+        # anew and waiting for a second zone change
+        if isChildFound:
+            break
+
         # correct world was not found - check the next page
         if not isChildFound:
             previousPage = currentPage
             loopCount = 0
             while currentPage == previousPage and loopCount < 30:
                 loopCount += 1
-                await p.mouse_handler.click_window_with_name('rightButton')
-
                 # ensure that wizwalker didn't misclick and that we actually changed pages
-                for child in await option_window[0].children():
-                    if await child.name() == 'pageCount':
-                        pageCount = await child.maybe_text()
-                        pageCount = pageCount[8:-9]
-                        currentPage = pageCount.split('/', 1)[0]
-                #print(f"{await child.name()}: {await read_control_checkbox_text(child)}")
+                currentPage = await _turn_spiral_page(p, option_window[0], 'rightButton')
 
     # 4 buttons per page - menuButtonNum / 4 rounded up to nearest whole number equals the page that the button is on
     # worldIndex = worldList.index(destinationWorld)
@@ -684,9 +707,9 @@ async def goToNewWorld(p, destinationWorld):
     return bigStackDestinations
 
 async def parseFile(fileName, worldName):
-    file = open(resource_path(f"{cur_path}/{fileName}"), "r")
-
-    lines = file.readlines()
+    # Closed after, and read as UTF-8 rather than the locale's code page
+    with open(resource_path(f"{cur_path}/{fileName}"), "r", encoding="utf-8") as file:
+        lines = file.readlines()
     start = 'WORLD - ' + worldName + '\n'
 
     try:
@@ -981,8 +1004,8 @@ async def toZoneDisplayName(clients, destinationZoneDisplay):
                  "Wysteria", "Zafaria", "Avalon", "Azteca", "Khrysalis", "Polaris", "Arcanum", "Mirage", "Empyrea",
                  "Karamelle", "Lemuria"]
 
-    file = open(resource_path(f"{cur_path}/{'traversalData/displayZones.txt'}"), "r")
-    lines = file.readlines()
+    with open(resource_path(f"{cur_path}/{'traversalData/displayZones.txt'}"), "r", encoding="utf-8") as file:
+        lines = file.readlines()
     lines = iter(lines)
     destinationZone = ''
 
@@ -1035,8 +1058,10 @@ async def toZone(clients, destinationZone):
         await asyncio.gather(*[goToDestination(p, destinationZone, worldName, bigStackDestinations, interactiveTeleportersOriginal) for p in clients])
         logger.info(f'reached destination zone: {destinationZone}.')
         return 0
-    except:
-        print(traceback.print_exc())
+    # Exception, not a bare except, so a cancel still cancels. print_exc() returns
+    # None, which is what this used to print after the traceback.
+    except Exception:
+        logger.exception(f'could not reach {destinationZone}')
         return 1
 
 
@@ -1063,7 +1088,7 @@ async def refillPotions(clients):
 
         try:
             await client.mouse_handler.activate_mouseless()
-        except:
+        except Exception:
             logger.error('MOUSELESS ERROR')
 
         await client.goto(-0.5264079570770264, -3021.25244140625)
@@ -1094,7 +1119,7 @@ async def refillPotions(clients):
 
         try:
             await client.mouse_handler.deactivate_mouseless()
-        except:
+        except Exception:
             logger.error('MOUSELESS ERROR')
 
         # Return
@@ -1129,7 +1154,7 @@ async def run():
 
   try:
     await main(clientHandler)
-  except:
+  except Exception:
     import traceback
 
     traceback.print_exc()
