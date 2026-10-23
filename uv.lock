@@ -287,13 +287,13 @@ requires-dist = [
 dev = [
     { name = "pytest", specifier = ">=9.0" },
     { name = "pytest-asyncio", specifier = ">=1.0" },
-    { name = "wizwalker", git = "https://github.com/BartleWorks/wizwalker.git?rev=79003692eaf949e0f5053566edbac4d17f0f25e4" },
+    { name = "wizwalker", git = "https://github.com/BartleWorks/wizwalker.git?rev=b9b0ff7834fde1d413aa74bd1a0c7c34bddf6bf5" },
 ]
 
 [[package]]
 name = "wizwalker"
 version = "1.8.2"
-source = { git = "https://github.com/BartleWorks/wizwalker.git?rev=79003692eaf949e0f5053566edbac4d17f0f25e4#79003692eaf949e0f5053566edbac4d17f0f25e4" }
+source = { git = "https://github.com/BartleWorks/wizwalker.git?rev=b9b0ff7834fde1d413aa74bd1a0c7c34bddf6bf5#b9b0ff7834fde1d413aa74bd1a0c7c34bddf6bf5" }
 dependencies = [
     { name = "aiofiles" },
     { name = "appdirs" },
