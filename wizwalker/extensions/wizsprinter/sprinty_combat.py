@@ -18,6 +18,7 @@ from .combat_backends.combat_config_parser import TargetType, TargetData, MoveCo
     , GambitSpec, ClearSpec, EchoSpec, SwapSpec, NotTypeSpec, ExcludeNameSpec, HangingType, HANGING_CATEGORIES \
     , hanging_type_info, POST_FILTER_TYPES, MEMBER_ATTRIBUTES, DECK_ATTRIBUTES, hanging_attributes
 from wizwalker.memory.memory_objects.conditionals import ReqHangingAura
+from wizwalker.memory.memory_objects.window import window_at_path
 from .combat_backends.backend_base import BaseCombatBackend
 from .combat_backends.spell_ranking import (
     AllOf, Amount, BestOf, CardFacts, CardSource, CategoryRanker, OneOf,
@@ -222,12 +223,10 @@ ENCHANT_TIMEOUT = 5.0
 #: the hand to change had no limit, so either hung the round.
 HAND_CHANGE_TIMEOUT = 5.0
 
-#: The hand, from the root of the UI, during the planning phase.
-HAND_PATH = ("WorldView", "PlanningPhase", "Alignment", "PlanningPhaseSubWindow", "SpellSelection", "Hand")
-
-#: The deck's card count, under the hand. Other windows are named `CountText` too, and a
-#: search of the whole UI by that name read the first of them, which holds no count:
-#: every read retried for two seconds and then answered (0, 0).
+#: The deck's card count, under the hand (CombatHandler's `_get_hand_window`). Other
+#: windows are named `CountText` too, and a search of the whole UI by that name read the
+#: first of them, which holds no count: every read retried for two seconds and then
+#: answered (0, 0).
 DECK_COUNTER_PATH = ("DeckCounter", "CountText")
 
 #: Reads of the count label before it is given up on for the round, and the pause
@@ -235,29 +234,6 @@ DECK_COUNTER_PATH = ("DeckCounter", "CountText")
 #: count, and neither is fixed by waiting long.
 CARD_COUNT_READS = 3
 CARD_COUNT_RETRY_INTERVAL = 0.05
-
-
-async def window_at_path(parent, path: Sequence[str]):
-    """The window at `path` under `parent`, matched by name one level at a time, or None.
-
-    Depth-first, backing out of a branch that does not complete the path, since siblings
-    can share a name. A few dozen reads, where a search of the whole UI by name is
-    thousands.
-    """
-    if not path:
-        return parent
-    try:
-        children = await parent.children()
-    except (ValueError, wizwalker.errors.WizWalkerMemoryError):
-        return None
-    for child in children:
-        try:
-            matches = await child.name() == path[0]
-        except (ValueError, wizwalker.errors.WizWalkerMemoryError):
-            continue
-        if matches and (found := await window_at_path(child, path[1:])) is not None:
-            return found
-    return None
 
 
 async def _poll(predicate, timeout: float, interval: float = 0.05) -> bool:
@@ -930,9 +906,8 @@ class SprintyCombat(CombatHandler):
         self.max_hand_size: Optional[int] = None
         # Enchant-only slots reached this walk, waiting for the round's cast.
         self.held_enchants: List[MoveConfig] = []
-        # The hand's window and the deck counter's label under it, found once a fight
-        # (see get_num_card_windows and get_card_counts).
-        self._hand_window = None
+        # The deck counter's label under the hand, found once a fight (see
+        # get_card_counts). CombatHandler holds the hand.
         self._count_window = None
         self._warned_count = False
         # The combatants and which of them is this client, read once a round while
@@ -952,7 +927,6 @@ class SprintyCombat(CombatHandler):
         self.max_hand_size = None
         self.held_enchants = []
         self._did_deck_inspect = False  # one-shot deck dump per fight
-        self._hand_window = None
         self._count_window = None
         self._warned_count = False
         self._forget_members()
@@ -1140,19 +1114,6 @@ class SprintyCombat(CombatHandler):
             return await wizwalker.utils.maybe_wait_for_any_value_with_timeout(_inner, sleep_time=0.2, timeout=2.0)
         except wizwalker.errors.ExceptionalTimeout:
             return []
-
-    async def _get_hand_window(self):
-        """The hand's window, found once a fight, by its path (`HAND_PATH`).
-
-        The search of the whole UI by name is kept as a fallback for a layout the path
-        does not describe. Raises IndexError when neither finds it.
-        """
-        if self._hand_window is None:
-            hand = await window_at_path(self.client.root_window, HAND_PATH)
-            if hand is None:
-                hand = (await self.client.root_window.get_windows_with_name("Hand"))[0]
-            self._hand_window = hand
-        return self._hand_window
 
     async def get_num_card_windows(self) -> int:
         # The hand is found once a fight, as the card windows are (`_get_card_windows`):
@@ -2473,8 +2434,7 @@ class SprintyCombat(CombatHandler):
                 card_count = await self.get_num_card_windows()
                 if card_count == 7:
                     break
-                if draw_windows := await self.client.root_window.get_windows_with_name("Draw"):
-                    draw_window = draw_windows[0]
+                if draw_window := await self.get_action_button("Draw"):
                     if await draw_window.is_control_grayed():
                         break
                     await self.draw_button()
@@ -2576,9 +2536,7 @@ class SprintyCombat(CombatHandler):
             if single == "willcast":
                 if willcasted:
                     return True
-                spell_checkbox_windows = await self.client.root_window.get_windows_with_type("SpellCheckBox")
-
-                wnd = ([x for x in spell_checkbox_windows if await x.name() == "PetCard"])[0]
+                wnd = await self._get_pet_card_window()
 
                 if await wnd.flags() - WindowFlags.disabled >= 0:
                     return True
