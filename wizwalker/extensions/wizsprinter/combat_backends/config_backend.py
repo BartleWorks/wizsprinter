@@ -19,6 +19,19 @@ def _parser() -> Lark:
     return Lark(get_sprinty_grammar())
 
 
+@lru_cache(maxsize=64)
+def parse_config_text(content: str) -> CombatConfig:
+    """`content` parsed, once for each distinct text.
+
+    A long config takes most of a second to parse, all of it holding the event loop, and
+    a provider is made for every player in every fight, mostly from the same few texts.
+    The config is shared between the providers made from one text, which is safe because
+    nothing changes a config once it is parsed: a fight only reads it.
+    """
+    tree = _parser().parse(content)
+    return CombatConfigProvider._expand_config(TreeToConfig().transform(tree))
+
+
 class CombatConfigProvider(BaseCombatBackend):
     def __init__(self, path: str, cast_time: float = 0.2, *, content: str = None):
         """
@@ -42,8 +55,7 @@ class CombatConfigProvider(BaseCombatBackend):
         return cls("<inline>", cast_time, content=content)
 
     def parse_config(self, file_contents) -> CombatConfig:
-        tree = _parser().parse(file_contents)
-        return self._expand_config(TreeToConfig().transform(tree))
+        return parse_config_text(file_contents)
 
     async def get_real_round(self, r: int) -> Optional[PriorityLine]:
         if r in self.config.specific_rounds:
@@ -58,7 +70,8 @@ class CombatConfigProvider(BaseCombatBackend):
     async def handle_no_cards_given(self):
         raise RuntimeError(f"Full config fail! \"{self.filename}\" might be empty or contains only explicit rounds. Consider adding a pass or something else")
 
-    def _expand_config(self, config: CombatConfig) -> CombatConfig:
+    @staticmethod
+    def _expand_config(config: CombatConfig) -> CombatConfig:
         old_rounds = [x for x in config.specific_rounds.values()] + config.infinite_rounds
         rounds = []
         for old_round in old_rounds:

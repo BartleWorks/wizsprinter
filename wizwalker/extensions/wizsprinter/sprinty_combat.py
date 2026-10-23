@@ -222,6 +222,43 @@ ENCHANT_TIMEOUT = 5.0
 #: the hand to change had no limit, so either hung the round.
 HAND_CHANGE_TIMEOUT = 5.0
 
+#: The hand, from the root of the UI, during the planning phase.
+HAND_PATH = ("WorldView", "PlanningPhase", "Alignment", "PlanningPhaseSubWindow", "SpellSelection", "Hand")
+
+#: The deck's card count, under the hand. Other windows are named `CountText` too, and a
+#: search of the whole UI by that name read the first of them, which holds no count:
+#: every read retried for two seconds and then answered (0, 0).
+DECK_COUNTER_PATH = ("DeckCounter", "CountText")
+
+#: Reads of the count label before it is given up on for the round, and the pause
+#: between them. A label that cannot be read is a missing window or text that is not a
+#: count, and neither is fixed by waiting long.
+CARD_COUNT_READS = 3
+CARD_COUNT_RETRY_INTERVAL = 0.05
+
+
+async def window_at_path(parent, path: Sequence[str]):
+    """The window at `path` under `parent`, matched by name one level at a time, or None.
+
+    Depth-first, backing out of a branch that does not complete the path, since siblings
+    can share a name. A few dozen reads, where a search of the whole UI by name is
+    thousands.
+    """
+    if not path:
+        return parent
+    try:
+        children = await parent.children()
+    except (ValueError, wizwalker.errors.WizWalkerMemoryError):
+        return None
+    for child in children:
+        try:
+            matches = await child.name() == path[0]
+        except (ValueError, wizwalker.errors.WizWalkerMemoryError):
+            continue
+        if matches and (found := await window_at_path(child, path[1:])) is not None:
+            return found
+    return None
+
 
 async def _poll(predicate, timeout: float, interval: float = 0.05) -> bool:
     """Read `predicate` until it holds or `timeout` passes; whether it held.
@@ -893,8 +930,11 @@ class SprintyCombat(CombatHandler):
         self.max_hand_size: Optional[int] = None
         # Enchant-only slots reached this walk, waiting for the round's cast.
         self.held_enchants: List[MoveConfig] = []
-        # The hand's window, found once a fight (see get_num_card_windows).
+        # The hand's window and the deck counter's label under it, found once a fight
+        # (see get_num_card_windows and get_card_counts).
         self._hand_window = None
+        self._count_window = None
+        self._warned_count = False
         # The combatants and which of them is this client, read once a round while
         # handle_round runs (see get_members).
         self._caching_members = False
@@ -913,6 +953,8 @@ class SprintyCombat(CombatHandler):
         self.held_enchants = []
         self._did_deck_inspect = False  # one-shot deck dump per fight
         self._hand_window = None
+        self._count_window = None
+        self._warned_count = False
         self._forget_members()
         await super().handle_combat()
 
@@ -1099,11 +1141,23 @@ class SprintyCombat(CombatHandler):
         except wizwalker.errors.ExceptionalTimeout:
             return []
 
-    async def get_num_card_windows(self) -> int:
-        # Found once a fight, as the card windows are (`_get_card_windows`): the
-        # search walks the whole UI, and the draw and discard waits poll this.
+    async def _get_hand_window(self):
+        """The hand's window, found once a fight, by its path (`HAND_PATH`).
+
+        The search of the whole UI by name is kept as a fallback for a layout the path
+        does not describe. Raises IndexError when neither finds it.
+        """
         if self._hand_window is None:
-            self._hand_window = (await self.client.root_window.get_windows_with_name("Hand"))[0]
+            hand = await window_at_path(self.client.root_window, HAND_PATH)
+            if hand is None:
+                hand = (await self.client.root_window.get_windows_with_name("Hand"))[0]
+            self._hand_window = hand
+        return self._hand_window
+
+    async def get_num_card_windows(self) -> int:
+        # The hand is found once a fight, as the card windows are (`_get_card_windows`):
+        # the draw and discard waits poll this.
+        await self._get_hand_window()
         try:
             num = 0
             for i in range(7):
@@ -1149,18 +1203,32 @@ class SprintyCombat(CombatHandler):
         return await self.get_card_with_predicate(_pred)
 
     async def get_card_counts(self) -> Tuple[int, int]:
-        # Issue: #6. Very rare error
-        async def _inner():
-            window = None
-            while window is None:
-                window, *_ = await self.client.root_window.get_windows_with_name("CountText")
-            # Read by its numbers alone: the word between them is localized,
-            # and stripping "of" read (0, 0) on every other language.
-            return parse_card_count(await window.maybe_text())
-        try:
-            return await wizwalker.utils.maybe_wait_for_any_value_with_timeout(_inner, sleep_time=0.2, timeout=2.0)
-        except wizwalker.errors.ExceptionalTimeout:
-            return (0, 0) # TODO: Maybe propagate, but good enough for now
+        """Cards left to draw and the deck's size, as the deck counter under the hand reads.
+
+        The label is found once a fight (`DECK_COUNTER_PATH`), and read by its numbers
+        alone: the word between them is localized, and stripping "of" read (0, 0) on every
+        other language. Both counts take in the treasure pile. (0, 0) when it cannot be
+        read in `CARD_COUNT_READS` tries, said once a fight at WARNING.
+        """
+        for attempt in range(CARD_COUNT_READS):
+            if attempt:
+                await asyncio.sleep(CARD_COUNT_RETRY_INTERVAL)
+            try:
+                if self._count_window is None:
+                    self._count_window = await window_at_path(await self._get_hand_window(), DECK_COUNTER_PATH)
+                if self._count_window is not None:
+                    counts = parse_card_count(await self._count_window.maybe_text())
+                    if counts is not None:
+                        return counts
+            except (IndexError, ValueError, wizwalker.errors.WizWalkerMemoryError):
+                pass
+            # Missing, or read as something other than a count: find it again
+            self._hand_window = self._count_window = None
+        if not self._warned_count:
+            self._warned_count = True
+            logger.warning("%sThe deck's card count could not be read; reading it as (0, 0)",
+                           self.log_tag and self.log_tag + " ")
+        return 0, 0
 
     async def deck_remaining(self) -> int:
         """Cards left in the main pile, as `?(deck.remaining ...)` reads it.
