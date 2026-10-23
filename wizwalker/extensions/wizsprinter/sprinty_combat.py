@@ -223,6 +223,31 @@ ENCHANT_TIMEOUT = 5.0
 #: the hand to change had no limit, so either hung the round.
 HAND_CHANGE_TIMEOUT = 5.0
 
+#: How long the hand may take to read the same twice after a fuse. It is laid out
+#: again, the fused card moving to the front, a little after the fuse first shows in
+#: its count, and a card found before that can hold another by the time it is clicked.
+HAND_SETTLE_TIMEOUT = 1.0
+HAND_SETTLE_INTERVAL = 0.1
+
+#: How long a cast card may take to leave the hand, and how many times one card is cast
+#: before it is given up on. The game drops a click now and then, most often just after
+#: a fuse, and a cast it dropped leaves the card where it was; the turn then passes
+#: with nothing cast, and the round is lost to a fizzle that never happened.
+CAST_LAND_TIMEOUT = 3.0
+CAST_ATTEMPTS = 3
+
+#: How long a target is waited on when the combatants read as a fight with nobody in
+#: it, or the one a cast is aimed at has gone. The game rebuilds their windows during
+#: a planning phase now and then (as a Balaur head takes its turn), and a read made
+#: before that holds the old ones: aimed at one, a cast picks its card up and clicks
+#: nowhere.
+COMBATANTS_SETTLE_TIMEOUT = 1.0
+COMBATANTS_SETTLE_INTERVAL = 0.1
+
+#: The targets that name an enemy. A miss on one is read again when the fight reads as
+#: having no enemy that can be hit.
+_ENEMY_TARGET_TYPES = (TargetType.type_boss, TargetType.type_enemy, TargetType.type_enemies)
+
 #: The deck's card count, under the hand (CombatHandler's `_get_hand_window`). Other
 #: windows are named `CountText` too, and a search of the whole UI by that name read the
 #: first of them, which holds no count: every read retried for two seconds and then
@@ -2486,6 +2511,17 @@ class SprintyCombat(CombatHandler):
 
         target = await self.try_get_config_target(move_config.target)
 
+        if (target == False and move_config.target.target_type in _ENEMY_TARGET_TYPES
+                and not await self.get_targetable_enemies()):
+            # A planning phase always has an enemy to hit, so a read with none was made
+            # while the game rebuilt the combatants: read them again until it is done.
+            async def _found(found):
+                return found is not False
+
+            again = await self._read_target_again(move_config, until=_found)
+            if again is not None:
+                target = again
+
         if target == False:  # Wouldn't want a None to mess it up
             _dbg(f"[MT-DBG] target is False for {move_config.target}")
             self.trace("  no such target: %s", move_config.target)
@@ -2649,6 +2685,7 @@ class SprintyCombat(CombatHandler):
                 _dbg(f"[MT-DBG] wrapped single target in list")
 
         fused = ""
+        fused_ids = []  # (spell, enchant) template ids the fused card is found again by
         # is_enchantable covers the already-enchanted case along with treasure,
         # item and cloaked cards, none of which can take an enchant either. With
         # an optional clause the chosen card may legitimately be one of those,
@@ -2702,6 +2739,7 @@ class SprintyCombat(CombatHandler):
                         return False
                     cur_card = found
                     fused = how
+                    fused_ids = [(picked_id, enchant_id)]
                     if move_config.move.second_enchant:
                         second_enchant_card = await self.try_get_spell(move_config.move.second_enchant, only_enchants=False)
                         if second_enchant_card != "none":
@@ -2717,6 +2755,7 @@ class SprintyCombat(CombatHandler):
                                         self.trace("  the card fused twice is not in the hand")
                                         return False
                                     cur_card = found
+                                    fused_ids.insert(0, (picked_id, second_id))
                                 elif not enchant_is_optional(move_config.move.second_enchant):
                                     return False
 
@@ -2749,6 +2788,7 @@ class SprintyCombat(CombatHandler):
                        await self.slot_of(to_cast), source)
         
         # Issue: 5. Casting wasn't that reliable
+        casts = 0
         try:
             while to_cast != None:
                 try:
@@ -2792,16 +2832,30 @@ class SprintyCombat(CombatHandler):
                         else:
                             self.trace("  no card in hand to enchant")
                         break
+                    target = await self._aim_again(move_config, target)
                     if self.tracing:
                         self.trace("  cast %s (slot %s) at %s", await self.describe_card(to_cast),
                                    await self.slot_of(to_cast), await self.describe_target(target))
+                    cards_before = len(await self.get_cards())
                     await to_cast.cast(target, sleep_time=self.config.cast_time*2)
                     await asyncio.sleep(self.config.cast_time) # give it some time for card list to update
                     if fused or needs_post_filter:
-                        # One cast. A fused card's name is its spell's, so looking it up
-                        # again would find a bare copy; and the next template match may
-                        # not satisfy the filters the one cast did.
-                        to_cast = None
+                        # This one card again, not a lookup by name: a fused card's name is
+                        # its spell's, so the lookup would find a bare copy, and the next
+                        # template match may not satisfy the filters this one did.
+                        casts += 1
+                        if await self._cast_landed(cards_before):
+                            to_cast = None
+                        elif casts >= CAST_ATTEMPTS:
+                            logger.warning("%s was cast %d times and never left the hand",
+                                           await self.describe_card(to_cast), casts)
+                            to_cast = None
+                        else:
+                            self.trace("  still in hand after %.0f s; casting it again", CAST_LAND_TIMEOUT)
+                            for ids in fused_ids:
+                                if again := await self._find_fused(await self.get_cards(), *ids):
+                                    to_cast = again
+                                    break
                     else:
                         to_cast = await self.try_get_spell(move_config.move.card, only_enchants=aims_at_spell)
                 except ValueError:
@@ -2858,6 +2912,7 @@ class SprintyCombat(CombatHandler):
             # a fixed sleep first spent the whole of it regardless.
             if await _poll(_fused, self.config.cast_time*2 if recast else 0.1):
                 self.trace("  fused after %d click(s): %d cards in hand", clicks, now)
+                await self._wait_for_hand_to_settle()
                 return True
             if loop.time() >= deadline:
                 break
@@ -2874,6 +2929,122 @@ class SprintyCombat(CombatHandler):
             names = "an enchant"
         logger.warning("%s did not fuse within %.0f s; skipping it", names, ENCHANT_TIMEOUT)
         return False
+
+    async def _hand_signature(self) -> Optional[list]:
+        """Each card in hand as its window, spell and enchant read now; None if one cannot be read."""
+        signature = []
+        try:
+            for card in await self.get_cards():
+                window = getattr(card, "_spell_window", None)
+                signature.append((getattr(window, "base_address", None), await card.template_id(),
+                                  await (await card.get_graphical_spell()).enchantment()))
+        except Exception:
+            return None
+        return signature
+
+    async def _wait_for_hand_to_settle(self) -> None:
+        """Wait, up to HAND_SETTLE_TIMEOUT, for two reads of the hand in a row to agree."""
+        previous = await self._hand_signature()
+
+        async def _settled():
+            nonlocal previous
+            await asyncio.sleep(HAND_SETTLE_INTERVAL)
+            now = await self._hand_signature()
+            settled = now is not None and now == previous
+            previous = now
+            return settled
+
+        if not await _poll(_settled, HAND_SETTLE_TIMEOUT, 0):
+            self.trace("  the hand was still changing after %.1f s", HAND_SETTLE_TIMEOUT)
+
+    async def _cast_landed(self, cards_before: int) -> bool:
+        """Whether a card just cast has left the hand, within CAST_LAND_TIMEOUT.
+
+        Counted by the cards in hand rather than the castable ones: a card picked up and
+        still waiting for its target grays the rest of the hand, which looks like a cast.
+        The hand's own window hidden counts too, since its cards keep their own flags.
+        """
+        async def _left():
+            if len(await self.get_cards()) < cards_before:
+                return True
+            try:
+                return not await (await self._get_hand_window()).is_visible()
+            except Exception:
+                return False
+
+        return await _poll(_left, CAST_LAND_TIMEOUT)
+
+    @staticmethod
+    def _members_in(target) -> List[CombatMember]:
+        """The combatants a cast is aimed at; none for a card, a spell, or no target."""
+        if isinstance(target, CombatMember):
+            return [target]
+        if isinstance(target, list) and target and all(isinstance(t, CombatMember) for t in target):
+            return list(target)
+        return []
+
+    @staticmethod
+    async def _is_whole(member: CombatMember) -> bool:
+        """Whether a combatant reads as one the game still has: its participant, and a
+        Health window to click when it has a window at all.
+
+        A combatant read before the game rebuilt their windows fails one or the other: its
+        participant cannot be read, or its window has lost its children.
+        """
+        try:
+            await (await member.get_participant()).owner_id_full()
+            control = getattr(member, "_combatant_control", None)
+            if control is not None and not await control.get_windows_with_name("Health"):
+                return False
+        except Exception:
+            return False
+        return True
+
+    async def _read_target_again(self, move_config: MoveConfig, *, until):
+        """The move's target, read from fresh combatants until `until(result)` holds.
+
+        None when it never does within COMBATANTS_SETTLE_TIMEOUT.
+        """
+        found = None
+
+        async def _read():
+            nonlocal found
+            self._forget_members()
+            try:
+                found = await self.try_get_config_target(move_config.target)
+                return await until(found)
+            except Exception:
+                # A combatant mid-rebuild cannot be read; the next read may find it whole
+                found = None
+                return False
+
+        if await _poll(_read, COMBATANTS_SETTLE_TIMEOUT, COMBATANTS_SETTLE_INTERVAL):
+            return found
+        return None
+
+    async def _aim_again(self, move_config: MoveConfig, target):
+        """The target a cast at combatants is clicked on: the move's target as it reads now.
+
+        The target was read when the round's line was walked, and an enchant's fuse can
+        take seconds after that. Read again from fresh combatants, a target the game has
+        rebuilt since is replaced by the one now in its place. When no reading in
+        COMBATANTS_SETTLE_TIMEOUT gives whole combatants, the target is kept as it was.
+        """
+        if not self._members_in(target):
+            return target
+
+        async def _whole(found):
+            members = self._members_in(found)
+            return bool(members) and all([await self._is_whole(m) for m in members])
+
+        found = await self._read_target_again(move_config, until=_whole)
+        if found is None:
+            self.trace("  the combatants did not read whole within %.1f s; casting at the target as read",
+                       COMBATANTS_SETTLE_TIMEOUT)
+            return target
+        if isinstance(target, list) and isinstance(found, CombatMember):
+            found = [found]  # a multi-target card takes a list, as it did when first read
+        return found
 
     async def _walk_priorities(self, priorities: List[MoveConfig]) -> None:
         """Cast the round's card, running held enchant slots first when it is not an attack.
