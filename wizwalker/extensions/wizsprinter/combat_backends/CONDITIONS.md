@@ -85,6 +85,22 @@ The practical consequence: `ally(-1)` is not the same as `ally(<count-1>)`,
 and is not meant to be. Use a forward index to name a specific *other*
 player, and a backward one to name a team position.
 
+#### Whose order the team is counted in
+
+By default the team is counted in the order it sits in the circle. A team
+that isn't an Adventure Party group sits in the order it walked in, so who
+is last depends on who arrived last.
+
+A host that knows its team's order can hand it over as `team_order`, the
+owner ids of its players in that order, to `SprintyCombat(...)` or by
+setting the attribute between rounds. A backward `ally(-N)` then counts
+through that order: the players it names come last, in its order, so
+`ally(last)` is the order's last player in the fight however the team sat.
+A player it doesn't name, someone else's wizard, comes before them in seat
+order, and a player it names who isn't in the fight is skipped. A forward
+`ally(N)` still counts the other players in seat order. With no
+`team_order`, nothing changes.
+
 ### Group targets (require aggregation)
 
 Group targets check a condition across multiple members. You must wrap them
