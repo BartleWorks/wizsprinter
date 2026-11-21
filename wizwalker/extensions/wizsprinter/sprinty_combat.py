@@ -906,6 +906,9 @@ async def card_is_multi_target(card: CombatCard) -> bool:
 
 
 class SprintyCombat(CombatHandler):
+    # The host's team order (see __init__); here too for a combat made without __init__.
+    team_order: Optional[List[int]] = None
+
     def __init__(
         self,
         client: wizwalker.client.Client,

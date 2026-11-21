@@ -70,3 +70,10 @@ async def test_a_forward_index_still_counts_the_others_in_seat_order():
 
     assert await combat.get_nth_ally_or_none(0) is team[1]
     assert await combat.get_nth_ally_or_none(2) is team[3]
+
+
+async def test_a_combat_made_without_init_has_no_order():
+    combat = fake_combat([], team=_team(2))
+    bare = object.__new__(type(combat))
+
+    assert bare.team_order is None
