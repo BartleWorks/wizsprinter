@@ -906,14 +906,22 @@ async def card_is_multi_target(card: CombatCard) -> bool:
 
 
 class SprintyCombat(CombatHandler):
+    # The host's team order (see __init__); here too for a combat made without __init__.
+    team_order: Optional[List[int]] = None
+
     def __init__(
         self,
         client: wizwalker.client.Client,
         config_provider: BaseCombatBackend,
         handle_mouseless: bool = False,
         log_tag: str = "",
+        team_order: Optional[Sequence[int]] = None,
     ):
         super().__init__(client)
+        # Owner ids of our team in the order the host wants it counted from the end, or
+        # None for the order the team sat in (see get_team_in_order). A host may set it
+        # between rounds, as the team it knows of fills in.
+        self.team_order: Optional[List[int]] = list(team_order) if team_order else None
         # Starts every turn_logger line, to tell the clients of one fight apart.
         self.log_tag = log_tag
         self.client: wizwalker.client.Client = client # to restore autocomplete
@@ -1368,6 +1376,30 @@ class SprintyCombat(CombatHandler):
                 members.append(mem)
         return members
 
+    async def get_team_in_order(self) -> List[CombatMember]:
+        """`get_team()`, counted in the host's `team_order` when it gave one.
+
+        A team that isn't an Adventure Party group sits in the order it entered the
+        fight, so the seats say nothing about who the host made its hitter. With an
+        order, the players it names come last, in its order, and anyone it doesn't
+        name, someone else's wizard, comes first in seat order. So `ally(last)` is the
+        order's last player in the fight, on every client, however the team sat. A
+        player named but not in the fight is skipped.
+        """
+        team = await self.get_team()
+        if not self.team_order:
+            return team
+        rank = {int(owner): i for i, owner in enumerate(self.team_order)}
+        named, others = [], []
+        for member in team:
+            owner = int(await (await member.get_participant()).owner_id_full())
+            if owner in rank:
+                named.append((rank[owner], member))
+            else:
+                others.append(member)
+        named.sort(key=lambda pair: pair[0])
+        return others + [member for _rank, member in named]
+
     @staticmethod
     async def _is_alive(member: CombatMember) -> bool:
         """False only for a member read at 0 health.
@@ -1415,10 +1447,11 @@ class SprintyCombat(CombatHandler):
 
     async def get_nth_ally_or_none(self, n: int) -> Optional[CombatMember]:
         # A negative index counts back from the last player on the team and so
-        # reads the team-inclusive list; a non-negative one counts forward from
-        # the first *other* player, as it always has.
+        # reads the team-inclusive list, in the host's order when it gave one; a
+        # non-negative one counts forward from the first *other* player, in seat
+        # order, as it always has.
         if n < 0:
-            return self._at_index(await self.get_team(), n)
+            return self._at_index(await self.get_team_in_order(), n)
         return self._at_index(await self.get_allies(), n)
 
     async def get_nth_enemy_or_none(self, n: int) -> Optional[CombatMember]:
