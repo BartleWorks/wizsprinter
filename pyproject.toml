@@ -24,7 +24,7 @@ dev = [
     # Our wizwalker, at the commit BartleBot pins, rather than PyPI's; move it with
     # that pin. A dependency group, not [tool.uv.sources]: uv reads a git or path
     # dependency's sources too, and two pins of wizwalker then refuse to lock.
-    "wizwalker @ git+https://github.com/BartleWorks/wizwalker.git@991c25715a55e739c3fa7640eaf9a1388b74f8ec",
+    "wizwalker @ git+https://github.com/BartleWorks/wizwalker.git@ed97af1a8d91cd74afcbccd81ae2afd10dc742f4",
 ]
 
 [tool.pytest.ini_options]
