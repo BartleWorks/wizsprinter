@@ -15,7 +15,8 @@ move_expr @ target | move_expr @ target
 ```
 
 `|` separates priorities in order: the first one that can be cast is cast. `pass`
-gives the round up.
+gives the round up. A round with no line of its own, in a config with no repeating
+lines, is passed too.
 
 `&` chains moves inside one priority, each with its own target, run in order:
 `willcast & any<damage> @ enemy`.
