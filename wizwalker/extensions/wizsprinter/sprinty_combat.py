@@ -14,7 +14,7 @@ from wizwalker.memory.memory_objects.enums import WindowFlags, HangingDispositio
 from wizwalker.memory.memory_objects.conditionals import charm_effect_types, ward_effect_types, over_time_effect_types, aura_effect_types
 
 from .combat_backends.combat_config_parser import TargetType, TargetData, MoveConfig, TemplateSpell \
-    , NamedSpell, SpellType, Spell, DrawSpell, Condition, AllCondition, ConditionTarget, ComparisonOp, AggregationMode \
+    , NamedSpell, EnchantChoice, SpellType, Spell, DrawSpell, Condition, AllCondition, ConditionTarget, ComparisonOp, AggregationMode \
     , GambitSpec, ClearSpec, EchoSpec, SwapSpec, NotTypeSpec, ExcludeNameSpec, HangingType, HANGING_CATEGORIES \
     , hanging_type_info, POST_FILTER_TYPES, MEMBER_ATTRIBUTES, DECK_ATTRIBUTES, hanging_attributes
 from wizwalker.memory.memory_objects.conditionals import ReqHangingAura
@@ -114,6 +114,34 @@ async def _is_enchant(card: CombatCard) -> bool:
         return False
     effects = await card.get_spell_effects()
     return any([await e.effect_target() is EffectTarget.spell for e in effects])
+
+
+#: The trained enchants that protect a buff from removal: Aegis on a blade or shield,
+#: Indemnity on a trap or weakness. Neither has an item or treasure version.
+PROTECTING_ENCHANTS = frozenset({"Aegis", "Indemnity"})
+_PROTECT_CARD_EFFECTS = frozenset({SpellEffects.protect_card_beneficial, SpellEffects.protect_card_harmful})
+
+
+async def _is_protecting_enchant(card: CombatCard) -> bool:
+    """Whether *card* is Aegis or Indemnity, by its name or by an effect that protects a card.
+
+    False for a card that can't be read, which then counts by its id as any enchant does.
+    """
+    try:
+        if await card.name() in PROTECTING_ENCHANTS:
+            return True
+        return any([await e.effect_type() in _PROTECT_CARD_EFFECTS for e in await card.get_spell_effects()])
+    except Exception:
+        return False
+
+
+async def _is_protected(effect) -> bool:
+    """Whether a protecting enchant was fused into what left *effect*: read on a card in hand
+    and on a hanging effect alike. False when it can't be read."""
+    try:
+        return bool(await effect.protected())
+    except Exception:
+        return False
 
 
 damage_effects = {
@@ -1458,6 +1486,21 @@ class SprintyCombat(CombatHandler):
         return self._at_index(await self.get_targetable_enemies(), n)
 
     async def try_get_spell(self, spell: Spell, only_enchants=False, only_enchantable: bool = False, castable: bool = True, multi: bool = False, enchant_bonus: int = 0) -> Union[CombatCard, str, None, List]:
+        if isinstance(spell, EnchantChoice):
+            # The first option in hand. Asked for any card, castable or not, it still
+            # prefers one that can be cast, so a grayed first choice gives way to a
+            # castable second rather than leave the card bare.
+            passes = (True,) if castable else (True, False)
+            for castable_only in passes:
+                for option in spell.options:
+                    found = await self.try_get_spell(
+                        option, only_enchants=only_enchants, only_enchantable=only_enchantable,
+                        castable=castable_only, multi=multi, enchant_bonus=enchant_bonus,
+                    )
+                    if found:
+                        return found
+            return None
+
         if isinstance(spell, NamedSpell):
             spell: NamedSpell
             if spell.name in ("pass", "none", "willcast", "discard"):
@@ -2339,9 +2382,12 @@ class SprintyCombat(CombatHandler):
             return ids
         for effect in effects:
             try:
-                ids.add((await effect.spell_template_id(), await effect.enchantment_spell_template_id()))
+                spell_id = await effect.spell_template_id()
+                enchant_id = await effect.enchantment_spell_template_id()
             except Exception as e:
                 _dbg(f"[REQ-DBG] stacks: a hanging effect unreadable ({type(e).__name__}: {e})")
+                continue
+            ids.add((spell_id, 0 if await _is_protected(effect) else enchant_id))
         return ids
 
     #: The kinds of effect that hang and whose copies don't add up: blades,
@@ -2362,13 +2408,19 @@ class SprintyCombat(CombatHandler):
         charms, wards or auras would land on some member that lacks it, so a mass trap
         stacks while one living enemy is without it. A card that leaves none of those
         has nothing to duplicate, and passes.
+
+        A protecting enchant (Aegis, Indemnity) is the exception: the game stacks its
+        buff as the plain spell's, so it counts as no enchant. In game the enchant's id
+        rides on the card and on the hanging effect both, each read `protected`.
         """
         try:
             spell_id = await card.template_id()
             enchant_id = await (await card.get_graphical_spell()).enchantment()
-            if enchant is not None and not isinstance(enchant, str) and await is_enchantable(card):
-                enchant_id = await enchant.template_id()
             effects = await get_inner_card_effects(card)
+            if enchant is not None and not isinstance(enchant, str) and await is_enchantable(card):
+                enchant_id = 0 if await _is_protecting_enchant(enchant) else await enchant.template_id()
+            elif enchant_id and any([await _is_protected(e) for e in effects]):
+                enchant_id = 0
         except Exception as e:
             _dbg(f"[REQ-DBG] stacks: card unreadable, passing it ({type(e).__name__}: {e})")
             return True

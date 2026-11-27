@@ -40,9 +40,15 @@ any<trap & !"Feint"> @ boss           # a trap, but not the card named exactly F
 # Enchantment variants
 any<damage>[epic] @ enemy             # enchant with any<enchant> named "epic"
 any<heal>[potent] @ self
+any<blade>[sharp | "Aegis"] @ self    # Sharpened Blade, or Aegis without one
+any<damage>[potent][epic] @ enemy     # two steps: a fusion, then an enchant
 ```
 
-A move takes up to two enchants in brackets, applied in order.
+Every enchant is optional: without it in hand the card is cast bare. `|` inside a bracket
+lists backups for the one enchant, first preferred: the first in hand that can be cast is
+fused, and the rest are left in hand, since a card takes one enchant. A second bracket is
+a second step, for a fusion, run only once the first has fused; it takes backups the same
+way.
 
 `!word` negates a spell type when `word` is one, and excludes a card by name otherwise.
 An unquoted name is the same loose, case-insensitive substring match a bare spell move
@@ -63,7 +69,9 @@ non-damage clause in hand order.
 `stacks` keeps a buff only when it would add to what already hangs where it lands:
 `any<blade & stacks>[sharp] @ ally(last)`. Two effects with the same spell template id and
 the same enchant template id don't stack, whoever cast them, and the move's own `[...]`
-enchant counts. A mass card stacks while one living member of its side lacks it.
+enchant counts. A protecting enchant (Aegis, Indemnity) is the exception: its buff stacks
+as the plain spell's, so it counts as no enchant. A mass card stacks while one living
+member of its side lacks it.
 `CONDITIONS.md` has the rules.
 
 `aura` is an aura on the caster (Amplify, Stabilize, Mend); `harmful_aura` is one cast at
