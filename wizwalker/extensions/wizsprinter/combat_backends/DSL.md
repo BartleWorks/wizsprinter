@@ -41,7 +41,6 @@ any<trap & !"Feint"> @ boss           # a trap, but not the card named exactly F
 any<damage>[epic] @ enemy             # enchant with any<enchant> named "epic"
 any<heal>[potent] @ self
 any<blade>[sharp | "Aegis"] @ self    # Sharpened Blade, or Aegis without one
-any<damage>[potent][epic] @ enemy     # two steps: a fusion, then an enchant
 ```
 
 Every enchant is optional: without it in hand the card is cast bare. `|` inside a bracket
