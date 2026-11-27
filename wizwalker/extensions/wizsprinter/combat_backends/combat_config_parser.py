@@ -52,8 +52,9 @@ def get_sprinty_grammar():
             move_discard: _spaced{"discard"}
 
             spell: any_spell | words | string
-            enchant: _open_bracket (any_spell | words | string) _close_bracket
-            second_enchant: _open_bracket (any_spell | words | string) _close_bracket
+            enchant: _open_bracket _enchant_option (_pipe _enchant_option)* _close_bracket
+            second_enchant: _open_bracket _enchant_option (_pipe _enchant_option)* _close_bracket
+            _enchant_option: any_spell | words | string
             
             target: (target_type | target_select)
             target_type: target_self | target_boss | target_enemy | target_enemies | target_ally | target_allies | target_aoe | target_spell | target_named
@@ -174,10 +175,14 @@ class TreeToConfig(Transformer):
             return NamedSpell(name, False, optional=enchant)
 
     def enchant(self, items):
-        return self.spell(items, enchant=True)
+        # `[sharp | "Aegis"]` lists backups for one enchant, first preferred: a card takes
+        # one enchant, so they are alternatives, never steps. A second bracket is a second
+        # step, for a fusion, and takes its own backups the same way.
+        options = [self.spell([item], enchant=True) for item in items]
+        return options[0] if len(options) == 1 else EnchantChoice(options)
 
     def second_enchant(self, items):
-        return self.spell(items, enchant=True)
+        return self.enchant(items)
     
     def move_pass(self, items):
         return NamedSpell("pass")

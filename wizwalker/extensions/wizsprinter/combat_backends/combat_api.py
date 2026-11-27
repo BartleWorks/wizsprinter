@@ -145,6 +145,21 @@ class NamedSpell(Spell):
         return f"NamedSpell(name=\"{self.name}\", is_literal={self.is_literal}, optional={self.optional})"
 
 
+class EnchantChoice(Spell):
+    """`[sharp | "Aegis"]`: one enchant, the first of `options` the hand holds.
+
+    Still a single step: at most one of them is fused. Each option is a `NamedSpell` or a
+    `TemplateSpell`, and the choice is optional as every parsed enchant is.
+    """
+
+    def __init__(self, options: List[Spell], optional: bool = True) -> None:
+        self.options = list(options)
+        self.optional = optional
+
+    def __repr__(self) -> str:
+        return f"EnchantChoice(options={self.options}, optional={self.optional})"
+
+
 # --- Hanging-effect category registry -------------------------------------
 # Single source of truth for which SpellEffects belong to which broad category,
 # which ConditionalSpellEffect requirement class checks for that category, and

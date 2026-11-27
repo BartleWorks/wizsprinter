@@ -27,6 +27,8 @@ SHARPENED_BLADE = 2001  # trained
 SHARPENED_BLADE_ITEM = 2002  # the item card: another template, so another id
 FEINT = 3001
 MASS_HEX = 3101
+AEGIS = 2101
+INDEMNITY = 2201
 
 
 @pytest.fixture(scope="module")
@@ -53,6 +55,13 @@ _FEINT = [
 ]
 _MASS_TRAP = [Effect(SpellEffects.modify_incoming_damage, EffectTarget.enemy_team, 30)]
 _ENCHANT = [Effect(SpellEffects.modify_card_damage, EffectTarget.spell, 0)]
+_AEGIS = [Effect(SpellEffects.protect_card_beneficial, EffectTarget.spell, 0)]
+_INDEMNITY = [Effect(SpellEffects.protect_card_harmful, EffectTarget.spell, 0)]
+_AEGIS_BLADE = [Effect(SpellEffects.modify_outgoing_damage, EffectTarget.friendly_single, 35, protected=True)]
+_INDEMNITY_FEINT = [
+    Effect(SpellEffects.modify_incoming_damage, EffectTarget.enemy_single, 70, protected=True),
+    Effect(SpellEffects.modify_incoming_damage, EffectTarget.self, 30, protected=True),
+]
 _HIT = [Effect(SpellEffects.damage, EffectTarget.enemy_single, 500)]
 
 
@@ -142,6 +151,113 @@ async def test_the_caster_does_not_matter():
 
     assert await combat.would_stack(feint, boss) is False
     assert await combat.would_stack(feint, Member("Boss2")) is True
+
+
+# ---------------------------------------------------------------------------
+# Protecting enchants: Aegis and Indemnity
+#
+# Read live on 2026-11-27 with a plain, an Aegis and a Sharpened Stormblade: the Aegis one
+# carries Aegis's id as its enchantment in hand and once hanging, and both read
+# `protected`. The game stacks it as a plain Stormblade, so `stacks` must too.
+# ---------------------------------------------------------------------------
+
+
+def _aegis_stormblade(hand):
+    return Card("Stormblade", _AEGIS_BLADE, hand, template_id=STORMBLADE, enchant_id=AEGIS)
+
+
+async def test_an_aegis_blade_does_not_stack_on_a_plain_one():
+    hand = []
+    blade = _aegis_stormblade(hand)
+    p1 = Member("P1", Hanging(STORMBLADE))
+    combat = fake_combat(hand, team=[Member("P2"), p1])
+
+    assert await combat.would_stack(blade, p1) is False
+
+
+async def test_a_plain_blade_does_not_stack_on_an_aegis_one():
+    hand = []
+    blade = Card("Stormblade", _BLADE, hand, template_id=STORMBLADE)
+    p1 = Member("P1", Hanging(STORMBLADE, AEGIS, protected=True))
+    combat = fake_combat(hand, team=[Member("P2"), p1])
+
+    assert await combat.would_stack(blade, p1) is False
+
+
+async def test_an_aegis_blade_does_not_stack_on_an_aegis_one():
+    hand = []
+    blade = _aegis_stormblade(hand)
+    p1 = Member("P1", Hanging(STORMBLADE, AEGIS, protected=True))
+    combat = fake_combat(hand, team=[Member("P2"), p1])
+
+    assert await combat.would_stack(blade, p1) is False
+
+
+async def test_an_aegis_blade_and_a_sharpened_one_stack_either_way():
+    hand = []
+    aegis_blade = _aegis_stormblade(hand)
+    sharp_blade = Card("Stormblade", _BLADE, hand, template_id=STORMBLADE, enchant_id=SHARPENED_BLADE)
+    sharpened = Member("P1", Hanging(STORMBLADE, SHARPENED_BLADE))
+    protected = Member("P2", Hanging(STORMBLADE, AEGIS, protected=True))
+    combat = fake_combat(hand, team=[protected, sharpened])
+
+    assert await combat.would_stack(aegis_blade, sharpened) is True
+    assert await combat.would_stack(sharp_blade, protected) is True
+
+
+async def test_the_moves_own_aegis_counts_as_no_enchant(parse):
+    """`any<blade & stacks>["Aegis"]` passes a Stormblade onto a P1 holding a plain one, as
+    `[sharp]` would cast it: what lands stacks as a plain Stormblade."""
+    hand = []
+    blade = Card("Stormblade", _BLADE, hand, template_id=STORMBLADE)
+    aegis = Card("Aegis", _AEGIS, hand, template_id=AEGIS)
+    p1 = Member("P1", Hanging(STORMBLADE))
+    combat = fake_combat(hand, team=[Member("P2"), p1])
+
+    assert await combat.would_stack(blade, p1, aegis) is False
+    assert await combat.try_execute_config(parse('any<blade & stacks>["Aegis"] @ ally(last)')[0]) is False
+    assert aegis.casts == [] and blade.casts == []
+
+
+async def test_the_moves_own_aegis_casts_onto_a_member_without_the_blade(parse):
+    hand = []
+    blade = Card("Stormblade", _BLADE, hand, template_id=STORMBLADE)
+    aegis = Card("Aegis", _AEGIS, hand, template_id=AEGIS)
+    p1 = Member("P1", Hanging(STORMBLADE, SHARPENED_BLADE))
+    combat = fake_combat(hand, team=[Member("P2"), p1])
+
+    assert await combat.try_execute_config(parse('any<blade & stacks>["Aegis"] @ ally(last)')[0]) is True
+    assert aegis.casts == [blade]
+    assert blade.casts == [p1]
+
+
+async def test_an_indemnity_feint_does_not_stack_on_a_plain_one():
+    hand = []
+    feint = Card("Feint", _INDEMNITY_FEINT, hand, template_id=FEINT, enchant_id=INDEMNITY)
+    boss = Member("Boss", Hanging(FEINT), boss=True)
+    combat = fake_combat(hand, team=[Member("P1")], enemies=[boss])
+
+    assert await combat.would_stack(feint, boss) is False
+
+
+async def test_the_moves_own_indemnity_counts_as_no_enchant():
+    hand = []
+    feint = Card("Feint", _FEINT, hand, template_id=FEINT)
+    indemnity = Card("Indemnity", _INDEMNITY, hand, template_id=INDEMNITY)
+    boss = Member("Boss", Hanging(FEINT, INDEMNITY, protected=True), boss=True)
+    combat = fake_combat(hand, team=[Member("P1")], enemies=[boss])
+
+    assert await combat.would_stack(feint, boss, indemnity) is False
+
+
+async def test_a_protecting_enchant_is_known_by_its_effect_whatever_its_name():
+    hand = []
+    blade = Card("Stormblade", _BLADE, hand, template_id=STORMBLADE)
+    renamed = Card("Some Future Aegis", _AEGIS, hand, template_id=AEGIS)
+    p1 = Member("P1", Hanging(STORMBLADE))
+    combat = fake_combat(hand, team=[Member("P2"), p1])
+
+    assert await combat.would_stack(blade, p1, renamed) is False
 
 
 # ---------------------------------------------------------------------------
