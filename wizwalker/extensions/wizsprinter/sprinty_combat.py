@@ -3295,8 +3295,13 @@ class SprintyCombat(CombatHandler):
                                    self.max_hand_size, await self.describe_hand())
                     if round_config is not None:
                         await self._walk_priorities(round_config.priorities)
-                    else:  # Very bad. Probably using empty config
+                    else:
+                        # Raises for a config with no lines at all. One that only runs out of
+                        # numbered lines gives the round up: raising ended the wizard's combat,
+                        # and it sat in the duel.
                         await self.config.handle_no_cards_given()
+                        self.trace("no line for this round: pass")
+                        await self.pass_button()
 
                 self.had_first_round = True  # might go bad on throw
                 self.prev_card_count = self.cur_card_count

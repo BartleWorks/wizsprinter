@@ -31,6 +31,12 @@ async def test_rounds_by_number_and_the_rest_in_turn():
 async def test_a_config_of_numbered_rounds_alone_has_nothing_else():
     provider = CombatConfigProvider.from_string("{1} pass")
     assert await provider.get_relative_round(5) is None
+    await provider.handle_no_cards_given()  # running out of lines is no error
+
+
+async def test_a_config_with_no_lines_at_all_fails():
+    provider = CombatConfigProvider.from_string("pass")
+    provider.config = type(provider.config)([])  # a copy of its own: parses are shared
     with pytest.raises(RuntimeError):
         await provider.handle_no_cards_given()
 
