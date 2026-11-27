@@ -955,6 +955,11 @@ async def card_is_multi_target(card: CombatCard) -> bool:
 class SprintyCombat(CombatHandler):
     # The host's team order (see __init__); here too for a combat made without __init__.
     team_order: Optional[List[int]] = None
+    # Whether the round handle_round last played did anything with a card: cast one (a
+    # fizzle included), fused an enchant, or changed the hand with a discard or a draw.
+    # False for a pass or a stun, and for a move that found nothing to act on, which
+    # try_execute_config's result does not tell apart. For a host judging a stalled fight.
+    turn_acted: bool = False
 
     def __init__(
         self,
@@ -1003,6 +1008,7 @@ class SprintyCombat(CombatHandler):
         self.rel_round_offset = 0
         self.was_pass = False
         self.had_first_round = False
+        self.turn_acted = False
         self.round_start_hand = None
         self.max_hand_size = None
         self.held_enchants = []
@@ -1578,6 +1584,7 @@ class SprintyCombat(CombatHandler):
         if not await self._wait_for_card_count_change(pre_discard_count):
             logger.warning("A discard did not leave the hand within %.0f s", HAND_CHANGE_TIMEOUT)
             return
+        self.turn_acted = True
         self.cur_card_count -= 1
 
     async def try_get_config_target(self, target: TargetData) -> Union[bool, Optional[CombatMember]]:
@@ -2570,6 +2577,7 @@ class SprintyCombat(CombatHandler):
                     if not await self._wait_for_card_count_change(card_count):
                         logger.warning("A draw did not reach the hand within %.0f s", HAND_CHANGE_TIMEOUT)
                         break
+                    self.turn_acted = True
                     self.cur_card_count += 1
                     await asyncio.sleep(self.config.cast_time*2)
 
@@ -2687,6 +2695,7 @@ class SprintyCombat(CombatHandler):
                 card = CombatCard(self, wnd)
                 if await card.is_castable():
                     await card.cast(target)
+                    self.turn_acted = True
                     await asyncio.sleep(self.config.cast_time*2)
                     return (True, True)
                 return True
@@ -2948,6 +2957,7 @@ class SprintyCombat(CombatHandler):
                                    await self.slot_of(to_cast), await self.describe_target(target))
                     cards_before = len(await self.get_cards())
                     await to_cast.cast(target, sleep_time=self.config.cast_time*2)
+                    self.turn_acted = True
                     await asyncio.sleep(self.config.cast_time) # give it some time for card list to update
                     if fused or needs_post_filter:
                         # This one card again, not a lookup by name: a fused card's name is
@@ -3022,6 +3032,7 @@ class SprintyCombat(CombatHandler):
             # a fixed sleep first spent the whole of it regardless.
             if await _poll(_fused, self.config.cast_time*2 if recast else 0.1):
                 self.trace("  fused after %d click(s): %d cards in hand", clicks, now)
+                self.turn_acted = True
                 await self._wait_for_hand_to_settle()
                 return True
             if loop.time() >= deadline:
@@ -3227,6 +3238,7 @@ class SprintyCombat(CombatHandler):
         # The combatants are read once for the round; see get_members.
         self._forget_members()
         self._caching_members = True
+        self.turn_acted = False
         try:
             await self._play_round()
         finally:
