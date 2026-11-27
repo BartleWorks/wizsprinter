@@ -103,6 +103,25 @@ async def is_enchantable(card: CombatCard) -> bool:
     ))
 
 
+async def _why_not_enchantable(card: CombatCard) -> str:
+    """Which of `is_enchantable`'s reads ruled *card* out, for a trace."""
+    reads = {
+        "enchanted": card.is_enchanted,
+        "enchanted from an item card": card.is_enchanted_from_item_card,
+        "a treasure card": card.is_treasure_card,
+        "an item card": card.is_item_card,
+        "cloaked": card.is_cloaked,
+    }
+    found = []
+    for label, read in reads.items():
+        try:
+            if await read():
+                found.append(label)
+        except Exception as e:
+            found.append(f"{label} unreadable ({type(e).__name__})")
+    return ", ".join(found) or "nothing read as ruling it out"
+
+
 async def _is_enchant(card: CombatCard) -> bool:
     """Whether *card* is an enchant: it acts on a spell, and nothing is fused into it.
 
@@ -2577,6 +2596,9 @@ class SprintyCombat(CombatHandler):
             enchant_card = await self.try_get_spell(enchant_spec, only_enchants=False, castable=False)
             if isinstance(enchant_card, CombatCard):
                 enchant_bonus = await enchant_damage_bonus(enchant_card)
+            if self.tracing:
+                found = await self.describe_card(enchant_card) if isinstance(enchant_card, CombatCard) else enchant_card
+                self.trace("  the move's enchant %s: %s", enchant_spec, found or "none in hand")
 
         is_template = isinstance(move_config.move.card, TemplateSpell)
         needs_req_met = is_template and SpellType.type_req_met in move_config.move.card.requirements
@@ -2775,12 +2797,15 @@ class SprintyCombat(CombatHandler):
         # item and cloaked cards, none of which can take an enchant either. With
         # an optional clause the chosen card may legitimately be one of those,
         # in which case it is cast as-is.
+        if wants_enchant and self.tracing and not await is_enchantable(cur_card):
+            self.trace("  %s takes no enchant: %s", await self.describe_card(cur_card), await _why_not_enchantable(cur_card))
         if wants_enchant and await is_enchantable(cur_card):
             if enchant_card != "none":
                 if enchant_card is not None:
                     # Issue: 5. Casting wasn't that reliable
                     enchant_is_grayed = not await enchant_card.is_castable()
                     if enchant_is_grayed:
+                        self.trace("  the enchant %s is grayed; casting bare", await self.describe_card(enchant_card))
                         # An optional enchant that cannot be cast is skipped;
                         # only a mandatory one fails the whole clause.
                         if not enchant_optional:
