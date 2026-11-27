@@ -302,7 +302,8 @@ through to the next `|` alternative.
   plain Stormblade onto a wizard holding a plain one. An already enchanted card
   counts with the enchant it carries.
 - **A protecting enchant doesn't.** An Aegis Stormblade doesn't stack with a plain
-  one, either way round, though the game lets both hang. Aegis or Indemnity
+  one, either way round, though the game lets both hang: the next hit uses only
+  the one placed last, and the other stays for a later hit. Aegis or Indemnity
   still rides on the card and on the hanging effect as its enchant id, so `stacks` counts an effect that reads `protected` as the
   plain spell's, and the move's own `[...]` Aegis or Indemnity as no enchant. An
   Aegis copy and a Sharpened one still stack.
